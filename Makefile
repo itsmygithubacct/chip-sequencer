@@ -13,8 +13,8 @@ WARNINGS := \
 	-Wstrict-prototypes -Wmissing-prototypes -Wformat=2
 CFLAGS ?= -O2 -g
 # Determinism is a hard invariant: -ffp-contract=off keeps FMA contraction from
-# perturbing the single float multiply in the render path (mirrors an earlier project
-# and the pinned byte-contract rule). The core links no libm.
+# perturbing the single float multiply in the render path (the byte-contract
+# rule in the pinned contract). The core links no libm.
 override CFLAGS += -std=c11 -fPIC -ffp-contract=off $(WARNINGS)
 
 # The core translation unit is POSIX-free (only <stdatomic.h> beyond
@@ -70,6 +70,11 @@ sanitize: | $(BUILD_DIR)
 		src/chip_sequencer.c src/chipseq_tools.c tests/test_chipseq.c \
 		-fsanitize=address,undefined -o $(BUILD_DIR)/test-chipseq-sanitize
 	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test-chipseq-sanitize
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g3 -ffp-contract=off $(WARNINGS) \
+		-fno-omit-frame-pointer -fsanitize=address,undefined \
+		src/chip_sequencer.c src/chipseq_tools.c tests/test_tools.c \
+		-fsanitize=address,undefined -o $(BUILD_DIR)/test-tools-sanitize
+	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test-tools-sanitize
 
 install: all
 	$(INSTALL) -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib
