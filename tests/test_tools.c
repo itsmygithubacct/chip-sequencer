@@ -1,4 +1,4 @@
-/* test_tools.c -- offline regression tests for the tools TU:
+/* test_tools.c -- offline regression tests for the tools translation unit:
  *
  *   - build a small ORIGINAL Standard MIDI File in memory (format 1, three
  *     tracks: tempo, a monophonic melody with a program change + a pitch bend,
@@ -111,6 +111,70 @@ static void build_smf(buf *out) {
     }
 }
 
+static void put_smf_header_div(buf *out, uint16_t ntracks, uint16_t division) {
+    bput_bytes(out, (const uint8_t *)"MThd", 4);
+    bput_be32(out, 6);
+    bput_be16(out, ntracks == 1 ? 0 : 1);
+    bput_be16(out, ntracks);
+    bput_be16(out, division);
+}
+
+static void put_smf_header(buf *out, uint16_t ntracks) {
+    put_smf_header_div(out, ntracks, 48);
+}
+
+/* A format-0 song whose first tempo event occurs after playback has begun. */
+static void build_delayed_tempo_smf(buf *out) {
+    put_smf_header(out, 1);
+    buf t = {0};
+    bput_vlq(&t, 0);  bput(&t, 0x90); bput(&t, 60); bput(&t, 100);
+    bput_vlq(&t, 48); bput(&t, 0xFF); bput(&t, 0x51); bput(&t, 3);
+    bput(&t, 0x06); bput(&t, 0x1A); bput(&t, 0x80); /* 150 BPM */
+    bput_vlq(&t, 48); bput(&t, 0x80); bput(&t, 60); bput(&t, 0);
+    bput_vlq(&t, 0);  bput(&t, 0xFF); bput(&t, 0x2F); bput(&t, 0);
+    append_mtrk(out, &t);
+    free(t.d);
+}
+
+/* Channel 1 claims chip column 0 first; channel 0 therefore lives on column 1.
+ * Its bend must follow it to column 1 rather than using the first empty cell. */
+static void build_bend_routing_smf(buf *out) {
+    put_smf_header(out, 1);
+    buf t = {0};
+    bput_vlq(&t, 0);  bput(&t, 0x91); bput(&t, 55); bput(&t, 100);
+    bput_vlq(&t, 0);  bput(&t, 0x90); bput(&t, 60); bput(&t, 100);
+    bput_vlq(&t, 24); bput(&t, 0xE0); bput(&t, 0x00); bput(&t, 0x60);
+    bput_vlq(&t, 24); bput(&t, 0x81); bput(&t, 55); bput(&t, 0);
+    bput_vlq(&t, 0);  bput(&t, 0x80); bput(&t, 60); bput(&t, 0);
+    bput_vlq(&t, 0);  bput(&t, 0xFF); bput(&t, 0x2F); bput(&t, 0);
+    append_mtrk(out, &t);
+    free(t.d);
+}
+
+/* With one row per pattern this produces 301 patterns, which the uint8 order
+ * representation cannot address without wrapping. */
+static void build_too_many_patterns_smf(buf *out) {
+    put_smf_header(out, 1);
+    buf t = {0};
+    bput_vlq(&t, 0);    bput(&t, 0x90); bput(&t, 60); bput(&t, 100);
+    bput_vlq(&t, 3600); bput(&t, 0x80); bput(&t, 60); bput(&t, 0);
+    bput_vlq(&t, 0);    bput(&t, 0xFF); bput(&t, 0x2F); bput(&t, 0);
+    append_mtrk(out, &t);
+    free(t.d);
+}
+
+/* A one-MIDI-tick note on a 480-TPQN timeline: both endpoints round to fine
+ * tick zero on the 4-row/6-tick grid, but the importer must not let it sustain. */
+static void build_short_note_smf(buf *out) {
+    put_smf_header_div(out, 1, 480);
+    buf t = {0};
+    bput_vlq(&t, 0); bput(&t, 0x90); bput(&t, 60); bput(&t, 100);
+    bput_vlq(&t, 1); bput(&t, 0x80); bput(&t, 60); bput(&t, 0);
+    bput_vlq(&t, 0); bput(&t, 0xFF); bput(&t, 0x2F); bput(&t, 0);
+    append_mtrk(out, &t);
+    free(t.d);
+}
+
 /* ------------------------------------------------------------------------- */
 /* the import map (original instruments, with sequences to exercise emission) */
 /* ------------------------------------------------------------------------- */
@@ -129,6 +193,14 @@ static const chipseq_instrument map_insts[] = {
 /* ------------------------------------------------------------------------- */
 /* helpers                                                                   */
 /* ------------------------------------------------------------------------- */
+
+static bool write_all(const char *path, const uint8_t *data, size_t n) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return false;
+    bool ok = fwrite(data, 1, n, fp) == n;
+    if (fclose(fp) != 0) ok = false;
+    return ok;
+}
 
 static uint8_t *read_all(const char *path, size_t *out_n) {
     FILE *fp = fopen(path, "rb");
@@ -164,6 +236,7 @@ int main(void) {
     const char *mid_path = "chipseq_tools_test.mid";
     const char *c1_path  = "chipseq_tools_out1.c";
     const char *c2_path  = "chipseq_tools_out2.c";
+    const char *c3_path  = "chipseq_tools_out3.c";
     char err[192];
 
     /* -------- write the reference SMF -------- */
@@ -205,6 +278,106 @@ int main(void) {
     err[0] = 0;
     CHECK(chipseq_midi_load(mid_path, NULL, err, sizeof err) == NULL, "midi_load rejects NULL map");
     CHECK(err[0] != 0, "midi_load writes a reason for a NULL map");
+
+    /* -------- malformed-file bounds and track-count checks -------- */
+    {
+        const char *path = "chipseq_tools_bad.mid";
+        static const uint8_t bad_hlen[] = {
+            'M','T','h','d', 0xFF,0xFF,0xFF,0xFF,
+            0,0, 0,1, 0,48,
+        };
+        CHECK(write_all(path, bad_hlen, sizeof bad_hlen), "write oversized-MThd fixture");
+        err[0] = 0;
+        CHECK(chipseq_midi_load(path, &map, err, sizeof err) == NULL,
+              "midi_load rejects wrapped/oversized MThd length");
+        CHECK(err[0] != 0, "oversized-MThd rejection has an error message");
+
+        buf header_only = {0};
+        put_smf_header(&header_only, 1);
+        CHECK(write_all(path, header_only.d, header_only.n), "write missing-track fixture");
+        free(header_only.d);
+        err[0] = 0;
+        CHECK(chipseq_midi_load(path, &map, err, sizeof err) == NULL,
+              "midi_load rejects a declared but missing MTrk");
+        CHECK(err[0] != 0, "missing-track rejection has an error message");
+        remove(path);
+    }
+
+    /* -------- tempo, bend routing, and order-width regressions -------- */
+    {
+        const char *path = "chipseq_tools_edge.mid";
+        buf edge = {0};
+        build_delayed_tempo_smf(&edge);
+        CHECK(write_all(path, edge.d, edge.n), "write delayed-tempo fixture");
+        free(edge.d);
+        err[0] = 0;
+        chipseq_song *tempo_song = chipseq_midi_load(path, &map, err, sizeof err);
+        CHECK(tempo_song != NULL, "load delayed-tempo fixture");
+        if (tempo_song) {
+            CHECK(tempo_song->bpm_q8 == CHIPSEQ_BPM(120),
+                  "tempo before a nonzero-tick event remains MIDI-default 120 BPM");
+            bool found_tempo = false;
+            for (uint16_t p = 0; p < tempo_song->pattern_count; p++) {
+                const chipseq_pattern *pat = &tempo_song->patterns[p];
+                for (uint16_t r = 0; r < pat->rows; r++) {
+                    for (uint8_t c = 0; c < tempo_song->channels; c++) {
+                        const chipseq_cell *cell = &pat->cells[(size_t)r * tempo_song->channels + c];
+                        if (cell->fx == CHIPSEQ_FX_TEMPO && cell->fxp == 150)
+                            found_tempo = true;
+                    }
+                }
+            }
+            CHECK(found_tempo, "nonzero-tick first tempo is emitted as FX_TEMPO");
+            chipseq_song_free(tempo_song);
+        }
+
+        edge = (buf){0};
+        build_bend_routing_smf(&edge);
+        CHECK(write_all(path, edge.d, edge.n), "write bend-routing fixture");
+        free(edge.d);
+        chipseq_midi_map bend_map = map;
+        bend_map.channels = 2;
+        err[0] = 0;
+        chipseq_song *bend_song = chipseq_midi_load(path, &bend_map, err, sizeof err);
+        CHECK(bend_song != NULL, "load bend-routing fixture");
+        if (bend_song) {
+            const chipseq_pattern *pat = &bend_song->patterns[0];
+            const chipseq_cell *row2 = &pat->cells[(size_t)2u * bend_song->channels];
+            CHECK(row2[0].fx != CHIPSEQ_FX_PORTA_UP && row2[1].fx == CHIPSEQ_FX_PORTA_UP,
+                  "pitch bend follows its MIDI channel to chip column 1");
+            chipseq_song_free(bend_song);
+        }
+
+        edge = (buf){0};
+        build_short_note_smf(&edge);
+        CHECK(write_all(path, edge.d, edge.n), "write sub-grid short-note fixture");
+        free(edge.d);
+        chipseq_midi_map short_map = map;
+        short_map.channels = 1;
+        err[0] = 0;
+        chipseq_song *short_song = chipseq_midi_load(path, &short_map, err, sizeof err);
+        CHECK(short_song != NULL, "load sub-grid short-note fixture");
+        if (short_song) {
+            const chipseq_cell *first = &short_song->patterns[0].cells[0];
+            CHECK(first->note == 60 && first->fx == CHIPSEQ_FX_NOTE_CUT && first->fxp == 1,
+                  "zero-duration quantization becomes a one-fine-tick note, not a sustain");
+            chipseq_song_free(short_song);
+        }
+
+        edge = (buf){0};
+        build_too_many_patterns_smf(&edge);
+        CHECK(write_all(path, edge.d, edge.n), "write too-many-patterns fixture");
+        free(edge.d);
+        chipseq_midi_map long_map = map;
+        long_map.channels = 1;
+        long_map.rows_per_pattern = 1;
+        err[0] = 0;
+        CHECK(chipseq_midi_load(path, &long_map, err, sizeof err) == NULL,
+              "midi_load rejects songs exceeding the uint8 order range");
+        CHECK(strstr(err, "patterns") != NULL || strstr(err, "order") != NULL,
+              "order-width rejection has a descriptive error");
+        remove(path);
+    }
 
     /* -------- load the real file -------- */
     err[0] = 0;
@@ -255,6 +428,51 @@ int main(void) {
     CHECK(file_contains(c1_path, "song_test_vol0_v"),
           "emitted C carries the lead volume sequence (stable naming)");
 
+    /* Hex/octal escapes must terminate before a following hex digit. */
+    {
+        static const char odd_name[] = { 1, 'A', '?', '?', '/', 0 };
+        chipseq_song odd = *song;
+        odd.name = odd_name;
+        err[0] = 0;
+        CHECK(chipseq_song_write_c(&odd, c2_path, "odd_song", err, sizeof err),
+              "write_c emits a song with non-printable name bytes");
+        CHECK(file_contains(c2_path, ".name = \"\\001A\\?\\?/\","),
+              "string escapes preserve a following hex digit and avoid C11 trigraphs");
+    }
+
+    /* Invalid/keyword identifiers are rejected before an uncompilable file is emitted. */
+    err[0] = 0;
+    CHECK(!chipseq_song_write_c(song, c2_path, "bad-name", err, sizeof err),
+          "write_c rejects punctuation in an identifier");
+    CHECK(err[0] != 0, "invalid identifier has an error message");
+    err[0] = 0;
+    CHECK(!chipseq_song_write_c(song, c2_path, "for", err, sizeof err),
+          "write_c rejects a C keyword identifier");
+
+    /* A valid silent song has no instrument table; emit portable ISO C11. */
+    {
+        static const chipseq_cell empty_cells[] = {
+            { CHIPSEQ_NOTE_NONE, 0, CHIPSEQ_VOL_NONE, CHIPSEQ_FX_NONE, 0 },
+        };
+        static const chipseq_pattern empty_patterns[] = { { empty_cells, 1 } };
+        static const uint8_t empty_order[] = { 0 };
+        static const chipseq_song empty_song = {
+            .name = NULL, .instruments = NULL, .instrument_count = 0,
+            .patterns = empty_patterns, .pattern_count = 1,
+            .order = empty_order, .order_length = 1,
+            .loop_order = CHIPSEQ_NO_LOOP, .channels = 1,
+            .rows_per_beat = 4, .ticks_per_row = 1, .bpm_q8 = CHIPSEQ_BPM(120),
+        };
+        err[0] = 0;
+        CHECK(chipseq_song_write_c(&empty_song, c3_path, "empty_song", err, sizeof err),
+              "write_c emits a zero-instrument song");
+        CHECK(file_contains(c3_path, ".name = NULL,") &&
+              file_contains(c3_path, ".instruments = NULL, .instrument_count = 0,"),
+              "zero-instrument/NULL-name fields round-trip as portable C");
+        CHECK(!file_contains(c3_path, "empty_song_insts[]"),
+              "zero-instrument song emits no empty-array extension");
+    }
+
     /* -------- write_c error path -------- */
     err[0] = 0;
     CHECK(!chipseq_song_write_c(NULL, c1_path, "song_test", err, sizeof err),
@@ -266,8 +484,11 @@ int main(void) {
     chipseq_song_free(NULL);   /* NULL-safe */
 
     remove(mid_path);
-    remove(c1_path);
-    remove(c2_path);
+    if (getenv("CHIPSEQ_KEEP_TEST_OUTPUT") == NULL) {
+        remove(c1_path);
+        remove(c2_path);
+        remove(c3_path);
+    }
 
     if (g_fails) {
         printf("test_tools: %d/%d checks FAILED\n", g_fails, g_checks);

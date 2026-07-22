@@ -13,15 +13,18 @@
  *      stale generation-checked handles rejected
  *   6. chipseq_song_frames == actual rendered length incl. FX_SPEED / FX_TEMPO
  *   7. chipseq_bounce_wav round-trips against a strict PCM/mono/16-bit reader
- *   8. tick timing is sample-rate-independent (44100 vs 48000)
+ *   8. tick timing scales across sample rates (44100 vs 48000)
+ *   9. render output is invariant to caller block partitioning
+ *  10. lifecycle/numeric edge cases and synth-control regressions
  */
 #include "chip_sequencer.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* ---- tracker-screen cell macros (author-side conveniences) ---------- */
+/* ---- tracker-screen cell macros (author-side conveniences) ------------- */
 #define CS__                   { CHIPSEQ_NOTE_NONE, 0, CHIPSEQ_VOL_NONE, CHIPSEQ_FX_NONE, 0 }
 #define CS_OFF                 { CHIPSEQ_NOTE_OFF,  0, CHIPSEQ_VOL_NONE, CHIPSEQ_FX_NONE, 0 }
 #define CS_CUT                 { CHIPSEQ_NOTE_CUT,  0, CHIPSEQ_VOL_NONE, CHIPSEQ_FX_NONE, 0 }
@@ -270,6 +273,27 @@ static void test_validation(void) {
         CHECK(!chipseq_song_validate(&s, err, sizeof err), "reject channels > max");
         CHECK(has(err, "channels"), "channels msg names channels");
     }
+    /* nonzero instrument_count requires a non-NULL instrument table */
+    {
+        chipseq_song s = base_song; s.instruments = NULL;
+        err[0] = 0;
+        CHECK(!chipseq_song_validate(&s, err, sizeof err),
+              "reject NULL instruments with nonzero instrument_count");
+        CHECK(has(err, "instruments") && has(err, "NULL"),
+              "NULL instrument-table error is descriptive");
+    }
+    /* cell volumes are either 0..64 or CHIPSEQ_VOL_NONE */
+    {
+        static const chipseq_cell bp[] = {
+            { CHIPSEQ_NOTE_NONE, 0, 65, CHIPSEQ_FX_NONE, 0 }, CS__,
+            CS__, CS__,
+        };
+        static const chipseq_pattern bpat[] = { { bp, 2 } };
+        chipseq_song s = base_song; s.patterns = bpat;
+        err[0] = 0;
+        CHECK(!chipseq_song_validate(&s, err, sizeof err), "reject cell volume > 64");
+        CHECK(has(err, "volume"), "bad-volume error names volume");
+    }
     /* zero-row pattern */
     {
         static const chipseq_pattern zpat[] = { { base_p0, 0 } };
@@ -285,6 +309,64 @@ static void test_validation(void) {
         CHECK(!chipseq_song_validate(&s, err, sizeof err), "reject bpm_q8 < min");
         CHECK(has(err, "bpm_q8"), "bpm msg names bpm_q8");
     }
+    /* documented instrument/sequence value ranges are part of validation */
+    {
+        chipseq_instrument bi[2] = { base_insts[0], base_insts[1] };
+        chipseq_song s = base_song; s.instruments = bi;
+        bi[0].duty = 64;
+        err[0] = 0;
+        CHECK(!chipseq_song_validate(&s, err, sizeof err), "reject pulse duty > 63");
+        CHECK(has(err, "duty"), "bad-duty error names duty");
+    }
+    {
+        chipseq_instrument bi[2] = { base_insts[0], base_insts[1] };
+        chipseq_song s = base_song; s.instruments = bi;
+        bi[0].wave = CHIPSEQ_WAVE_NOISE; bi[0].noise_mode = 2;
+        err[0] = 0;
+        CHECK(!chipseq_song_validate(&s, err, sizeof err), "reject invalid noise mode");
+        CHECK(has(err, "noise_mode"), "bad-noise-mode error is descriptive");
+    }
+    {
+        static const int8_t bad_values[] = { 64, 65 };
+        static const chipseq_seq bad_vol = {
+            bad_values, 2, CHIPSEQ_SEQ_NO_LOOP, CHIPSEQ_SEQ_NO_RELEASE
+        };
+        chipseq_instrument bi[2] = { base_insts[0], base_insts[1] };
+        chipseq_song s = base_song; s.instruments = bi; bi[0].vol_seq = &bad_vol;
+        err[0] = 0;
+        CHECK(!chipseq_song_validate(&s, err, sizeof err), "reject volume-sequence value > 64");
+        CHECK(has(err, "vol_seq") && has(err, "value"),
+              "bad volume-sequence error identifies its value");
+    }
+    {
+        static const int8_t bad_values[] = { 32, 0 };
+        static const chipseq_seq bad_duty = {
+            bad_values, 2, CHIPSEQ_SEQ_NO_LOOP, CHIPSEQ_SEQ_NO_RELEASE
+        };
+        chipseq_instrument bi[2] = { base_insts[0], base_insts[1] };
+        chipseq_song s = base_song; s.instruments = bi; bi[0].duty_seq = &bad_duty;
+        err[0] = 0;
+        CHECK(!chipseq_song_validate(&s, err, sizeof err), "reject duty-sequence value below one");
+        CHECK(has(err, "duty_seq") && has(err, "value"),
+              "bad duty-sequence error identifies its value");
+    }
+    {
+        static const uint8_t bad_wavetable[CHIPSEQ_WAVETABLE_LEN] = { 16 };
+        chipseq_instrument bi[2] = { base_insts[0], base_insts[1] };
+        chipseq_song s = base_song; s.instruments = bi;
+        bi[0].wave = CHIPSEQ_WAVE_WAVETABLE; bi[0].wavetable = bad_wavetable;
+        err[0] = 0;
+        CHECK(!chipseq_song_validate(&s, err, sizeof err), "reject wavetable nibble > 15");
+        CHECK(has(err, "wavetable"), "bad-wavetable error is descriptive");
+    }
+    {
+        chipseq_instrument bi[2] = { base_insts[0], base_insts[1] };
+        chipseq_song s = base_song; s.instruments = bi;
+        bi[1].tri_steps = 2;
+        err[0] = 0;
+        CHECK(!chipseq_song_validate(&s, err, sizeof err), "reject triangle step count 1..3");
+        CHECK(has(err, "tri_steps"), "bad-triangle-step error is descriptive");
+    }
     /* err_len == 0 must not crash / write */
     CHECK(!chipseq_song_validate(NULL, NULL, 0), "NULL song rejected, no err write");
 }
@@ -296,14 +378,13 @@ static void test_validation(void) {
 /* THE BYTE CONTRACT. This 64-bit FNV-1a hash is computed over the entire
  * int16 PCM produced by chipseq_render_song(ref_song, default options). Any
  * change to it is a deliberate, reviewed audio change (a golden rehash), never
- * an accident -- exactly the documented contract makes. If a code change alters
+ * an accident -- exactly the documented byte-contract guarantee. If a change alters
  * the render path, this test fails and the change must be justified. */
-/* Rehashed golden: the decimation FIR + one-pole lowpass are now persistent
- * streaming filter state in the chipseq struct instead of stack locals reset per
- * render call, so render output is block-size-independent and the offline bounce
- * matches the live pcm-mixer path. This value bakes in the streaming filter (no
- * per-4096-chunk boundary resets) -- a deliberate, reviewed golden rehash. */
-#define REF_GOLDEN_FNV64 0xe32ddaedfd6ac02cULL
+/* Rehashed golden: track-end gains now clear at the exact ending sample, and a
+ * triangle advances with the same one-cycle Q32 phase convention as every other
+ * pitched oscillator (rather than sounding one octave flat). Both are deliberate
+ * correctness fixes to the byte contract. */
+#define REF_GOLDEN_FNV64 0x7af68f37b171809eULL
 
 static void test_determinism_golden(void) {
     char err[128];
@@ -441,6 +522,23 @@ static void test_command_queue(void) {
         (void)nfree;
         chipseq_shutdown(&seq);
     }
+
+    /* (d) stop-all reports queue pressure instead of silently losing a stop. */
+    {
+        chipseq seq; CHECK(chipseq_init(&seq, &opt), "init(d)");
+        int h = chipseq_sfx_play(&seq, &sfx_loop, 1.0f, 0, true);
+        CHECK(h > 0, "start looping SFX for stop-all queue test");
+        chipseq_flush_commands(&seq);
+        for (unsigned i = 0; i < CHIPSEQ_CMD_QUEUE; i++)
+            CHECK(chipseq_music_set_volume(&seq, 0.5f), "fill queue before stop-all");
+        CHECK(!chipseq_sfx_stop_all(&seq), "stop-all reports a full command queue");
+        CHECK(chipseq_sfx_active(&seq, h), "failed stop-all does not claim success");
+        chipseq_flush_commands(&seq);
+        CHECK(chipseq_sfx_stop_all(&seq), "stop-all queues once space is available");
+        chipseq_flush_commands(&seq);
+        CHECK(!chipseq_sfx_active(&seq, h), "successful stop-all releases the SFX");
+        chipseq_shutdown(&seq);
+    }
 }
 
 /* ======================================================================== */
@@ -501,6 +599,29 @@ static void test_sfx_stealing(void) {
         }
         chipseq_shutdown(&seq);
     }
+
+
+    /* (c) the former 14-bit generation boundary must not resurrect a stale
+     * handle. Sequential one-shots deliberately reuse slot zero. */
+    {
+        chipseq seq; CHECK(chipseq_init(&seq, &opt), "init generation-wrap regression");
+        int stale = -1;
+        bool cycled = true;
+        for (unsigned i = 0; i < 16383u; i++) {
+            int h = chipseq_sfx_play(&seq, &sfx_oneshot, 1.0f, 0, false);
+            if (i == 0) stale = h;
+            if (h <= 0) { cycled = false; break; }
+            chipseq_flush_commands(&seq);
+            if (!chipseq_sfx_stop(&seq, h)) { cycled = false; break; }
+            chipseq_flush_commands(&seq);
+        }
+        CHECK(cycled, "cycle one slot through the old 14-bit generation limit");
+        int current = chipseq_sfx_play(&seq, &sfx_oneshot, 1.0f, 0, false);
+        CHECK(current > 0 && current != stale, "generation does not alias the stale handle");
+        CHECK(!chipseq_sfx_active(&seq, stale) && !chipseq_sfx_stop(&seq, stale),
+              "old-boundary stale handle remains rejected");
+        chipseq_shutdown(&seq);
+    }
 }
 
 /* ======================================================================== */
@@ -532,6 +653,17 @@ static uint64_t measure_rendered_frames(const chipseq_song *song, uint32_t sr) {
 }
 
 static void test_song_frames(void) {
+    static const chipseq_cell cycle_cells[] = { CS_FX(ORDER_JUMP, 0) };
+    static const chipseq_pattern cycle_pats[] = { { cycle_cells, 1 } };
+    static const uint8_t cycle_order[] = { 0 };
+    static const chipseq_song cycle_song = {
+        .name = "effect-cycle", .instruments = NULL, .instrument_count = 0,
+        .patterns = cycle_pats, .pattern_count = 1,
+        .order = cycle_order, .order_length = 1,
+        .loop_order = CHIPSEQ_NO_LOOP, .channels = 1,
+        .rows_per_beat = 4, .ticks_per_row = 1, .bpm_q8 = CHIPSEQ_BPM(120),
+    };
+
     struct { const chipseq_song *song; const char *name; } cases[] = {
         { &ref_song, "ref" },
         { &fx_song,  "fx(SPEED+TEMPO)" },
@@ -551,6 +683,58 @@ static void test_song_frames(void) {
         CHECK(diff == 0,
               "song_frames == rendered length exactly (incl. FX_SPEED/FX_TEMPO)");
     }
+    CHECK(chipseq_song_validate(&cycle_song, NULL, 0),
+          "effect-driven cycle is structurally valid");
+    CHECK(chipseq_song_frames(&cycle_song, 44100) == UINT64_MAX,
+          "song_frames detects an infinite FX_ORDER_JUMP cycle");
+    CHECK(chipseq_song_frames(&base_song, 0) == 0,
+          "song_frames rejects an invalid sample rate");
+    chipseq_song declared_loop = base_song;
+    declared_loop.loop_order = 0;
+    CHECK(chipseq_song_frames(&declared_loop, 0) == 0,
+          "song_frames rejects an invalid sample rate before loop classification");
+}
+
+static void test_offline_length_and_looping(void) {
+    static const chipseq_cell cells[] = { CS_N(A,4, 0,64) };
+    static const chipseq_pattern patterns[] = { { cells, 1 } };
+    static const uint8_t order[] = { 0 };
+    static const chipseq_song loop_song = {
+        .name = "offline-loop", .instruments = sfx_insts, .instrument_count = 1,
+        .patterns = patterns, .pattern_count = 1,
+        .order = order, .order_length = 1,
+        .loop_order = 0, .channels = 1,
+        .rows_per_beat = 4, .ticks_per_row = 1, .bpm_q8 = CHIPSEQ_BPM(120),
+    };
+    chipseq_song finite_song = loop_song;
+    finite_song.loop_order = CHIPSEQ_NO_LOOP;
+    chipseq_options opt; chipseq_options_init(&opt);
+    opt.sample_rate = 8000; opt.oversample = 1;
+    char err[128];
+
+    uint64_t natural = chipseq_song_frames(&finite_song, opt.sample_rate);
+    CHECK(natural > 0 && natural < SIZE_MAX / 2u, "offline-loop fixture has finite pass length");
+    if (natural == 0 || natural >= SIZE_MAX / 2u) return;
+
+    size_t frames = 0;
+    int16_t *finite = chipseq_render_song(&finite_song, &opt, natural * 2u,
+                                          &frames, err, sizeof err);
+    CHECK(finite != NULL && frames == (size_t)natural,
+          "max_frames is a cap, not silence-padding for a finite song");
+    chipseq_pcm_free(finite);
+
+    int16_t *looped = chipseq_render_song(&loop_song, &opt, natural * 2u,
+                                          &frames, err, sizeof err);
+    CHECK(looped != NULL && frames == (size_t)(natural * 2u),
+          "capped offline render returns the requested looping duration");
+    if (looped && frames == (size_t)(natural * 2u)) {
+        size_t nonzero = 0;
+        for (size_t i = (size_t)natural; i < frames; i++)
+            if (looped[i] != 0) nonzero++;
+        CHECK(nonzero > (size_t)natural / 2u,
+              "declared loop point produces audio after the first pass");
+    }
+    chipseq_pcm_free(looped);
 }
 
 /* ======================================================================== */
@@ -619,10 +803,17 @@ static void test_bounce_roundtrip(void) {
     free(w);
     chipseq_pcm_free(r);
     remove(path);
+
+    uint64_t too_many_frames = ((uint64_t)UINT32_MAX - 36u) / sizeof(int16_t) + 1u;
+    err[0] = 0;
+    CHECK(!chipseq_bounce_wav(&sfx_loop, &opt, path, too_many_frames, err, sizeof err),
+          "bounce_wav rejects output beyond the RIFF 32-bit size limit");
+    CHECK(has(err, "RIFF") || has(err, "WAV"),
+          "oversized WAV rejection has a descriptive error");
 }
 
 /* ======================================================================== */
-/* 8. tick timing sample-rate-independent                                    */
+/* 8. tick timing scales across sample rates                                */
 /* ======================================================================== */
 
 /* Capture, for a song at rate sr, the sequence of ticks: each element is the
@@ -688,6 +879,372 @@ static void test_tick_rate_independence(void) {
 }
 
 /* ======================================================================== */
+/* 9. render-block partition invariance                                      */
+/* ======================================================================== */
+
+static void test_block_partition_invariance(void) {
+    chipseq_options opt; chipseq_options_init(&opt);
+    uint64_t natural64 = chipseq_song_frames(&sfx_oneshot, opt.sample_rate);
+    CHECK(natural64 > 0 && natural64 < SIZE_MAX - 257u,
+          "block-partition fixture has a finite length");
+    if (natural64 == 0 || natural64 >= SIZE_MAX - 257u) return;
+
+    size_t natural = (size_t)natural64;
+    size_t total = natural + 257u; /* include filter tail and sustained silence */
+    int16_t *whole = calloc(total, sizeof *whole);
+    int16_t *split = calloc(total, sizeof *split);
+    CHECK(whole && split, "allocate block-partition buffers");
+    if (!whole || !split) { free(whole); free(split); return; }
+
+    chipseq a, b;
+    char err[96];
+    CHECK(chipseq_init(&a, &opt) && chipseq_init(&b, &opt),
+          "initialize block-partition engines");
+    CHECK(chipseq_music_play(&a, &sfx_oneshot, false, err, sizeof err) &&
+          chipseq_music_play(&b, &sfx_oneshot, false, err, sizeof err),
+          "start block-partition fixture");
+
+    chipseq_render_s16(&a, whole, total);
+    size_t done = 0;
+    while (done < total) {
+        size_t chunk = total - done > 13u ? 13u : total - done;
+        chipseq_render_s16(&b, split + done, chunk);
+        done += chunk;
+    }
+    CHECK(memcmp(whole, split, total * sizeof *whole) == 0,
+          "one large render equals the same render split into 13-frame blocks");
+
+    bool silent_tail = true;
+    for (size_t i = natural + 32u; i < total; i++)
+        if (whole[i] != 0) { silent_tail = false; break; }
+    CHECK(silent_tail, "voices stop after the natural end plus the FIR tail");
+
+    uint16_t order_pos, row; uint8_t tick;
+    CHECK(!chipseq_music_position(&a, &order_pos, &row, &tick) &&
+          !chipseq_music_position(&b, &order_pos, &row, &tick),
+          "both block partitions publish the stopped state");
+    chipseq_shutdown(&a); chipseq_shutdown(&b);
+
+    /* The same invariant must hold when an SFX ends mid-block and releases
+     * music ducking at that exact sample. */
+    memset(whole, 0, total * sizeof *whole);
+    memset(split, 0, total * sizeof *split);
+    opt.sfx_duck = 0.0f;
+    CHECK(chipseq_init(&a, &opt) && chipseq_init(&b, &opt),
+          "initialize SFX-duck partition engines");
+    CHECK(chipseq_music_play(&a, &sfx_oneshot, true, err, sizeof err) &&
+          chipseq_music_play(&b, &sfx_oneshot, true, err, sizeof err),
+          "start looping music for SFX-duck partition test");
+    CHECK(chipseq_sfx_play(&a, &sfx_oneshot, 1.0f, 0, false) > 0 &&
+          chipseq_sfx_play(&b, &sfx_oneshot, 1.0f, 0, false) > 0,
+          "start one-shot SFX for duck partition test");
+    chipseq_render_s16(&a, whole, total);
+    done = 0;
+    while (done < total) {
+        size_t chunk = total - done > 13u ? 13u : total - done;
+        chipseq_render_s16(&b, split + done, chunk);
+        done += chunk;
+    }
+    CHECK(memcmp(whole, split, total * sizeof *whole) == 0,
+          "SFX end and duck release are block-partition invariant");
+    chipseq_shutdown(&a); chipseq_shutdown(&b);
+    free(whole); free(split);
+}
+
+/* ======================================================================== */
+/* 10. lifecycle/numeric and synth-control regressions                       */
+/* ======================================================================== */
+
+static void test_lifecycle_and_numeric_inputs(void) {
+    chipseq_options good, bad;
+    chipseq_options_init(&good);
+    chipseq seq;
+
+    CHECK(chipseq_init(&seq, &good), "initial valid init succeeds");
+    CHECK(atomic_is_lock_free(&seq.queue_head) && atomic_is_lock_free(&seq.queue_tail) &&
+          atomic_is_lock_free(&seq.sfx_claim[0]) && atomic_is_lock_free(&seq.snap_seq) &&
+          atomic_is_lock_free(&seq.enabled),
+          "every render/game handshake is lock-free on this supported target");
+    bad = good; bad.sample_rate = 1;
+    CHECK(!chipseq_init(&seq, &bad), "invalid reinit fails");
+    CHECK(!chipseq_is_enabled(&seq), "failed reinit leaves engine disabled");
+    CHECK(!chipseq_music_set_volume(&seq, 0.5f),
+          "failed reinit leaves engine uninitialized");
+    chipseq_set_enabled(&seq, true);
+    CHECK(!chipseq_is_enabled(&seq), "cannot enable an uninitialized engine");
+    chipseq_shutdown(&seq);
+
+    bad = good; bad.volume = NAN;
+    CHECK(!chipseq_init(&seq, &bad), "init rejects NaN master volume");
+    bad = good; bad.sfx_duck = NAN;
+    CHECK(!chipseq_init(&seq, &bad), "init rejects NaN duck gain");
+    bad = good; bad.volume = 1.5f;
+    CHECK(!chipseq_init(&seq, &bad), "init rejects master volume above one");
+
+    CHECK(chipseq_init(&seq, &good), "reinitialize after rejected options");
+    CHECK(!chipseq_music_set_volume(&seq, NAN), "music volume rejects NaN");
+    CHECK(chipseq_sfx_play(&seq, &sfx_oneshot, NAN, 0, false) == -1,
+          "SFX play rejects NaN gain");
+    chipseq_shutdown(&seq);
+}
+
+static void test_synth_regressions(void) {
+    static const chipseq_cell note_cell[] = { CS_N(A,4, 0,64) };
+    static const chipseq_pattern one_pat[] = { { note_cell, 1 } };
+    static const uint8_t one_order[] = { 0 };
+    char err[96];
+
+    /* A note-off uses the declared release value on that tick, and a cut at
+     * tick zero is immediate. */
+    {
+        static const int8_t release_values[] = { 64, 23, 0 };
+        static const chipseq_seq release_env = {
+            release_values, 3, CHIPSEQ_SEQ_NO_LOOP, 1
+        };
+        static const chipseq_instrument release_inst[] = {
+            { .wave = CHIPSEQ_WAVE_PULSE, .duty = CHIPSEQ_DUTY_50,
+              .vol_seq = &release_env },
+        };
+        static const chipseq_cell release_cells[] = {
+            CS_N(A,4, 0,64), CS_OFF,
+        };
+        static const chipseq_pattern release_pat[] = { { release_cells, 2 } };
+        static const chipseq_song release_song = {
+            .name = "release-index", .instruments = release_inst, .instrument_count = 1,
+            .patterns = release_pat, .pattern_count = 1,
+            .order = one_order, .order_length = 1,
+            .loop_order = CHIPSEQ_NO_LOOP, .channels = 1,
+            .rows_per_beat = 4, .ticks_per_row = 1, .bpm_q8 = CHIPSEQ_BPM(120),
+        };
+        chipseq_options opt; chipseq_options_init(&opt);
+        opt.sample_rate = 8000; opt.oversample = 1;
+        chipseq seq; int16_t sample; unsigned guard = 0;
+        CHECK(chipseq_init(&seq, &opt), "init release-index engine");
+        CHECK(chipseq_music_play(&seq, &release_song, false, err, sizeof err),
+              "play release-index song");
+        chipseq_flush_commands(&seq);
+        while (seq.music.active && seq.music.row == 0 && guard++ < 2000u)
+            chipseq_render_s16(&seq, &sample, 1);
+        CHECK(seq.voices[0].released && seq.voices[0].seq_pos[0] == 1u,
+              "note-off holds the first release-envelope index for its tick");
+        chipseq_shutdown(&seq);
+    }
+    {
+        static const chipseq_instrument cut_inst[] = {
+            { .wave = CHIPSEQ_WAVE_PULSE, .duty = CHIPSEQ_DUTY_50 },
+        };
+        static const chipseq_cell cut_cell[] = {
+            { CHIPSEQ_NOTE(CHIPSEQ_PC_A,4), 0, 64, CHIPSEQ_FX_NOTE_CUT, 0 },
+        };
+        static const chipseq_pattern cut_pat[] = { { cut_cell, 1 } };
+        static const chipseq_song cut_song = {
+            .name = "cut-zero", .instruments = cut_inst, .instrument_count = 1,
+            .patterns = cut_pat, .pattern_count = 1,
+            .order = one_order, .order_length = 1,
+            .loop_order = CHIPSEQ_NO_LOOP, .channels = 1,
+            .rows_per_beat = 4, .ticks_per_row = 2, .bpm_q8 = CHIPSEQ_BPM(120),
+        };
+        chipseq_options opt; chipseq_options_init(&opt);
+        chipseq seq;
+        CHECK(chipseq_init(&seq, &opt), "init zero-cut engine");
+        CHECK(chipseq_music_play(&seq, &cut_song, false, err, sizeof err),
+              "play zero-cut song");
+        chipseq_flush_commands(&seq);
+        CHECK(seq.voices[0].vol == 0u, "FX_NOTE_CUT parameter zero cuts on tick zero");
+        chipseq_shutdown(&seq);
+    }
+
+    /* Repeated pitch slides saturate rather than invoking signed-overflow UB. */
+    {
+        static const int8_t porta_pitch_values[] = { 127 };
+        static const chipseq_seq porta_pitch_seq = {
+            porta_pitch_values, 1, CHIPSEQ_SEQ_NO_LOOP, CHIPSEQ_SEQ_NO_RELEASE
+        };
+        static const chipseq_instrument porta_inst[] = {
+            { .wave = CHIPSEQ_WAVE_PULSE, .duty = CHIPSEQ_DUTY_50,
+              .pitch_seq = &porta_pitch_seq },
+        };
+        static const chipseq_cell porta_cell[] = {
+            { CHIPSEQ_NOTE(CHIPSEQ_PC_A,4), 0, 64, CHIPSEQ_FX_PORTA_UP, 255 },
+        };
+        static const chipseq_pattern porta_pat[] = { { porta_cell, 1 } };
+        static const chipseq_song porta_song = {
+            .name = "porta-saturate", .instruments = porta_inst, .instrument_count = 1,
+            .patterns = porta_pat, .pattern_count = 1,
+            .order = one_order, .order_length = 1,
+            .loop_order = 0, .channels = 1,
+            .rows_per_beat = 4, .ticks_per_row = 2, .bpm_q8 = CHIPSEQ_BPM(120),
+        };
+        chipseq_options opt; chipseq_options_init(&opt);
+        opt.sample_rate = 8000; opt.oversample = 1;
+        chipseq seq; int16_t sample; unsigned guard = 0;
+        CHECK(chipseq_init(&seq, &opt), "init portamento saturation engine");
+        CHECK(chipseq_music_play(&seq, &porta_song, true, err, sizeof err),
+              "play portamento saturation song");
+        chipseq_flush_commands(&seq);
+        seq.voices[0].cur_pitch = INT32_MAX - 10;
+        while (seq.music.tick == 0 && guard++ < 2000u)
+            chipseq_render_s16(&seq, &sample, 1);
+        CHECK(seq.voices[0].cur_pitch == INT32_MAX,
+              "portamento saturates at INT32_MAX without wrapping");
+        chipseq_shutdown(&seq);
+    }
+
+    /* Triangle and pulse use the same one-cycle Q32 phase convention. */
+    {
+        static const chipseq_instrument tri_inst[] = {
+            { .wave = CHIPSEQ_WAVE_TRIANGLE, .tri_steps = 0 },
+        };
+        static const chipseq_song tri_song = {
+            .name = "triangle", .instruments = tri_inst, .instrument_count = 1,
+            .patterns = one_pat, .pattern_count = 1,
+            .order = one_order, .order_length = 1,
+            .loop_order = CHIPSEQ_NO_LOOP, .channels = 1,
+            .rows_per_beat = 4, .ticks_per_row = 6, .bpm_q8 = CHIPSEQ_BPM(120),
+        };
+        chipseq_options opt; chipseq_options_init(&opt);
+        opt.sample_rate = 8000; opt.oversample = 1;
+        chipseq seq; int16_t sample;
+        CHECK(chipseq_init(&seq, &opt), "init triangle regression engine");
+        CHECK(chipseq_music_play(&seq, &tri_song, false, err, sizeof err),
+              "play triangle regression song");
+        chipseq_flush_commands(&seq);
+        uint32_t inc = seq.voices[0].phase_inc;
+        chipseq_render_s16(&seq, &sample, 1);
+        CHECK(inc > 0 && seq.voices[0].phase == inc,
+              "triangle advances by the full note phase increment");
+        chipseq_shutdown(&seq);
+    }
+
+    /* Auto-vibrato is note-relative and remains off through vib_delay. */
+    {
+        static const chipseq_instrument vib_inst[] = {
+            { .wave = CHIPSEQ_WAVE_PULSE, .duty = CHIPSEQ_DUTY_50,
+              .vib_speed = 4, .vib_depth = 8, .vib_delay = 3 },
+        };
+        static const chipseq_song vib_song = {
+            .name = "vib-delay", .instruments = vib_inst, .instrument_count = 1,
+            .patterns = one_pat, .pattern_count = 1,
+            .order = one_order, .order_length = 1,
+            .loop_order = 0, .channels = 1,
+            .rows_per_beat = 4, .ticks_per_row = 6, .bpm_q8 = CHIPSEQ_BPM(120),
+        };
+        chipseq_options opt; chipseq_options_init(&opt);
+        opt.sample_rate = 8000; opt.oversample = 1;
+        chipseq seq; int16_t sample;
+        CHECK(chipseq_init(&seq, &opt), "init vibrato-delay engine");
+        CHECK(chipseq_music_play(&seq, &vib_song, true, err, sizeof err),
+              "play vibrato-delay song");
+        chipseq_flush_commands(&seq);
+        uint32_t base_inc = seq.voices[0].phase_inc;
+        int guard = 0;
+        while (seq.voices[0].note_ticks < 3u && guard++ < 4096)
+            chipseq_render_s16(&seq, &sample, 1);
+        CHECK(seq.voices[0].note_ticks == 3u && seq.voices[0].phase_inc == base_inc,
+              "auto-vibrato remains neutral through vib_delay ticks");
+        while (seq.voices[0].note_ticks < 4u && guard++ < 4096)
+            chipseq_render_s16(&seq, &sample, 1);
+        CHECK(seq.voices[0].note_ticks == 4u && seq.voices[0].phase_inc != base_inc,
+              "auto-vibrato starts after vib_delay");
+        chipseq_shutdown(&seq);
+    }
+
+    /* NES nonlinear mixing still honors per-voice stereo pan. */
+    {
+        static const chipseq_cell left_cell[] = {
+            { CHIPSEQ_NOTE(CHIPSEQ_PC_A,4), 0, 64, CHIPSEQ_FX_PAN, 0 },
+        };
+        static const chipseq_cell right_cell[] = {
+            { CHIPSEQ_NOTE(CHIPSEQ_PC_A,4), 0, 64, CHIPSEQ_FX_PAN, 255 },
+        };
+        static const chipseq_pattern left_pat[] = { { left_cell, 1 } };
+        static const chipseq_pattern right_pat[] = { { right_cell, 1 } };
+        static const chipseq_instrument pulse_inst[] = {
+            { .wave = CHIPSEQ_WAVE_PULSE, .duty = CHIPSEQ_DUTY_50 },
+        };
+        static const chipseq_song left_song = {
+            .name = "pan-left", .instruments = pulse_inst, .instrument_count = 1,
+            .patterns = left_pat, .pattern_count = 1, .order = one_order, .order_length = 1,
+            .loop_order = CHIPSEQ_NO_LOOP, .channels = 1,
+            .rows_per_beat = 4, .ticks_per_row = 6, .bpm_q8 = CHIPSEQ_BPM(120),
+        };
+        static const chipseq_song right_song = {
+            .name = "pan-right", .instruments = pulse_inst, .instrument_count = 1,
+            .patterns = right_pat, .pattern_count = 1, .order = one_order, .order_length = 1,
+            .loop_order = CHIPSEQ_NO_LOOP, .channels = 1,
+            .rows_per_beat = 4, .ticks_per_row = 6, .bpm_q8 = CHIPSEQ_BPM(120),
+        };
+        chipseq_options opt; chipseq_options_init(&opt);
+        opt.sample_rate = 8000; opt.oversample = 1; opt.mix_mode = CHIPSEQ_MIX_NES;
+        chipseq lseq, rseq; int16_t left[2], right[2];
+        CHECK(chipseq_init(&lseq, &opt) && chipseq_init(&rseq, &opt),
+              "init NES-pan engines");
+        CHECK(chipseq_music_play(&lseq, &left_song, false, err, sizeof err) &&
+              chipseq_music_play(&rseq, &right_song, false, err, sizeof err),
+              "play NES-pan songs");
+        chipseq_render_s16_stereo(&lseq, left, 1);
+        chipseq_render_s16_stereo(&rseq, right, 1);
+        CHECK(left[0] > 0 && left[1] == 0, "NES pan 0 routes pulse fully left");
+        CHECK(right[0] == 0 && right[1] > 0, "NES pan 255 routes pulse fully right");
+        chipseq_shutdown(&lseq); chipseq_shutdown(&rseq);
+    }
+
+    /* PCM interpolation wraps at loop_end, and large steps use modulo rather
+     * than a bounded subtraction loop. */
+    {
+        static const int16_t frames[] = { 1000, 2000, 3000, 30000 };
+        static const chipseq_pcm pcm = { frames, 4, 1, 3, 69 };
+        static const chipseq_instrument pcm_inst[] = {
+            { .wave = CHIPSEQ_WAVE_PCM, .pcm = &pcm },
+        };
+        static const chipseq_song pcm_song = {
+            .name = "pcm-loop", .instruments = pcm_inst, .instrument_count = 1,
+            .patterns = one_pat, .pattern_count = 1, .order = one_order, .order_length = 1,
+            .loop_order = CHIPSEQ_NO_LOOP, .channels = 1,
+            .rows_per_beat = 4, .ticks_per_row = 6, .bpm_q8 = CHIPSEQ_BPM(120),
+        };
+        chipseq_options opt; chipseq_options_init(&opt);
+        opt.sample_rate = 8000; opt.oversample = 1;
+        chipseq seq; int16_t sample;
+        CHECK(chipseq_init(&seq, &opt), "init PCM interpolation engine");
+        CHECK(chipseq_music_play(&seq, &pcm_song, false, err, sizeof err),
+              "play PCM interpolation song");
+        chipseq_flush_commands(&seq);
+        seq.voices[0].pcm_pos = ((uint64_t)2u << 16) | 0x8000u;
+        chipseq_render_s16(&seq, &sample, 1);
+        CHECK(sample == 625, "PCM loop-end interpolation blends into loop_start");
+        CHECK(seq.voices[0].pcm_pos == (((uint64_t)1u << 16) | 0x8000u),
+              "PCM position wraps modulo the loop length");
+        chipseq_shutdown(&seq);
+    }
+    {
+        static const int16_t frames[] = { 1000, 2000, 3000, 4000 };
+        static const chipseq_pcm pcm = { frames, 4, 0, 1, 0 };
+        static const chipseq_instrument pcm_inst[] = {
+            { .wave = CHIPSEQ_WAVE_PCM, .pcm = &pcm },
+        };
+        static const chipseq_cell high_cell[] = { CS_N(G,9, 0,64) };
+        static const chipseq_pattern high_pat[] = { { high_cell, 1 } };
+        static const chipseq_song high_song = {
+            .name = "pcm-large-step", .instruments = pcm_inst, .instrument_count = 1,
+            .patterns = high_pat, .pattern_count = 1, .order = one_order, .order_length = 1,
+            .loop_order = CHIPSEQ_NO_LOOP, .channels = 1,
+            .rows_per_beat = 4, .ticks_per_row = 6, .bpm_q8 = CHIPSEQ_BPM(120),
+        };
+        chipseq_options opt; chipseq_options_init(&opt);
+        opt.sample_rate = 8000; opt.oversample = 1;
+        chipseq seq; int16_t samples[2];
+        CHECK(chipseq_init(&seq, &opt), "init large-step PCM engine");
+        CHECK(chipseq_music_play(&seq, &high_song, false, err, sizeof err),
+              "play large-step PCM song");
+        chipseq_render_s16(&seq, samples, 2);
+        CHECK(samples[0] == 250 && samples[1] == 250 && seq.voices[0].active,
+              "large PCM steps remain inside a one-frame loop");
+        chipseq_shutdown(&seq);
+    }
+}
+
+/* ======================================================================== */
 /* main                                                                      */
 /* ======================================================================== */
 
@@ -699,8 +1256,12 @@ int main(void) {
     test_command_queue();
     test_sfx_stealing();
     test_song_frames();
+    test_offline_length_and_looping();
     test_bounce_roundtrip();
     test_tick_rate_independence();
+    test_block_partition_invariance();
+    test_lifecycle_and_numeric_inputs();
+    test_synth_regressions();
 
     if (g_fails) {
         printf("test_chipseq: %d/%d checks FAILED\n", g_fails, g_checks);

@@ -9,7 +9,6 @@
  *                          channels via a chipseq_midi_map, malloc'ing a song.
  *   chipseq_song_free   -- free a midi-loaded song (never a static literal).
  *   chipseq_song_write_c-- emit self-contained, byte-stable C literals.
- *
  */
 #include "chip_sequencer.h"
 
@@ -22,11 +21,22 @@
 /* small utilities                                                           */
 /* ------------------------------------------------------------------------- */
 
+#if defined(__GNUC__) || defined(__clang__)
+static void tools_set_err(char *err, size_t err_len, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+#endif
 static void tools_set_err(char *err, size_t err_len, const char *fmt, ...) {
     if (!err || err_len == 0) return;
     va_list ap;
     va_start(ap, fmt);
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+#endif
     (void)vsnprintf(err, err_len, fmt, ap);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
     va_end(ap);
 }
 
@@ -54,7 +64,9 @@ static void vec_free(vec *v) {
 
 static void *vec_push(vec *v) {
     if (v->len == v->cap) {
-        size_t ncap = v->cap ? v->cap * 2 : 32;
+        if (v->cap > SIZE_MAX / 2u) return NULL;
+        size_t ncap = v->cap ? v->cap * 2u : 32u;
+        if (v->elem != 0 && ncap > SIZE_MAX / v->elem) return NULL;
         void *nd = realloc(v->data, ncap * v->elem);
         if (!nd) return NULL;
         v->data = nd;
@@ -74,7 +86,7 @@ enum { MEV_NOTEON = 0, MEV_NOTEOFF, MEV_PROGRAM, MEV_TEMPO, MEV_BEND };
 
 typedef struct {
     uint64_t tick;   /* absolute MIDI tick */
-    uint32_t seq;    /* insertion order, for a stable total sort */
+    uint64_t seq;    /* insertion order, for a stable total sort */
     uint32_t d3;     /* tempo usec/quarter, or 14-bit bend value */
     uint8_t  type;
     uint8_t  chan;   /* MIDI channel 0..15 */
@@ -108,7 +120,7 @@ static uint32_t read_vlq(const uint8_t **pp, const uint8_t *end, bool *ok) {
 /* Append every relevant event of one MTrk chunk [p,end) into `evs`, tagging
  * each with a monotonically increasing seq from *seqp for a stable sort. */
 static bool parse_track(const uint8_t *p, const uint8_t *end, vec *evs,
-                        uint32_t *seqp, bool import_bend,
+                        uint64_t *seqp, bool import_bend,
                         char *err, size_t err_len) {
     uint64_t abstick = 0;
     uint8_t status = 0;
@@ -117,6 +129,10 @@ static bool parse_track(const uint8_t *p, const uint8_t *end, vec *evs,
         bool ok = false;
         uint32_t delta = read_vlq(&p, end, &ok);
         if (!ok) { tools_set_err(err, err_len, "malformed VLQ delta-time"); return false; }
+        if (abstick > UINT64_MAX - delta) {
+            tools_set_err(err, err_len, "MIDI tick position overflows uint64");
+            return false;
+        }
         abstick += delta;
 
         if (p >= end) { tools_set_err(err, err_len, "truncated event"); return false; }
@@ -239,13 +255,41 @@ static int mev_cmp(const void *a, const void *b) {
 typedef struct {
     uint64_t start_fine, end_fine;
     uint8_t  col;    /* chip channel */
+    uint8_t  mchan;  /* originating MIDI channel */
     uint8_t  note, inst, vol;
 } placement;
 
 /* MIDI tick -> fine sequencer-tick position (rows*ticks_per_row resolution). */
-static uint64_t to_fine(uint64_t t, unsigned rpb, unsigned tpr, unsigned div) {
-    uint64_t num = t * (uint64_t)rpb * (uint64_t)tpr;
-    return (num + (uint64_t)div / 2u) / (uint64_t)div;
+static bool to_fine(uint64_t t, unsigned rpb, unsigned tpr, unsigned div,
+                    uint64_t *out) {
+    if (rpb == 0 || tpr == 0 || div == 0) return false;
+    if (t > UINT64_MAX / rpb) return false;
+    uint64_t num = t * rpb;
+    if (num > UINT64_MAX / tpr) return false;
+    num *= tpr;
+    uint64_t half = (uint64_t)div / 2u;
+    if (num > UINT64_MAX - half) return false;
+    *out = (num + half) / div;
+    return true;
+}
+
+/* Preserve every accepted note as a bounded note after quantization. A note
+ * that rounds to zero duration gets one fine tick. If a delayed start and its
+ * end both occupy one row, the cell cannot encode NOTE_DELAY and NOTE_CUT at
+ * once, so extend only to the next row boundary where a cut is representable. */
+static bool normalize_note_end(uint64_t start, uint64_t end, unsigned tpr,
+                               uint64_t *out) {
+    if (end <= start) {
+        if (start == UINT64_MAX) return false;
+        end = start + 1u;
+    }
+    if (start % tpr != 0u && start / tpr == end / tpr) {
+        uint64_t row = start / tpr;
+        if (row == UINT64_MAX || row + 1u > UINT64_MAX / tpr) return false;
+        end = (row + 1u) * tpr;
+    }
+    *out = end;
+    return true;
 }
 
 static uint8_t choose_inst(const chipseq_midi_map *map, uint8_t chan,
@@ -277,11 +321,15 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
     if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); tools_set_err(err, err_len, "midi_load: seek failed"); return NULL; }
     long fsz = ftell(fp);
     if (fsz < 14) { fclose(fp); tools_set_err(err, err_len, "midi_load: file too small for an SMF"); return NULL; }
+    if ((uintmax_t)fsz > (uintmax_t)SIZE_MAX) {
+        fclose(fp); tools_set_err(err, err_len, "midi_load: file is too large"); return NULL;
+    }
+    size_t file_size = (size_t)fsz;
     rewind(fp);
 
-    uint8_t *buf = malloc((size_t)fsz);
+    uint8_t *buf = malloc(file_size);
     if (!buf) { fclose(fp); tools_set_err(err, err_len, "midi_load: out of memory"); return NULL; }
-    if (fread(buf, 1, (size_t)fsz, fp) != (size_t)fsz) {
+    if (fread(buf, 1, file_size, fp) != file_size) {
         free(buf); fclose(fp);
         tools_set_err(err, err_len, "midi_load: short read");
         return NULL;
@@ -309,26 +357,43 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
     /* --- MThd --- */
     if (memcmp(buf, "MThd", 4) != 0) { tools_set_err(err, err_len, "midi_load: missing MThd"); goto fail; }
     uint32_t hlen = rd_be32(buf + 4);
-    if (hlen < 6 || 8u + hlen > (uint32_t)fsz) { tools_set_err(err, err_len, "midi_load: bad MThd length"); goto fail; }
+    if (hlen < 6 || (size_t)hlen > file_size - 8u) {
+        tools_set_err(err, err_len, "midi_load: bad MThd length"); goto fail;
+    }
     uint16_t format   = rd_be16(buf + 8);
     uint16_t ntracks  = rd_be16(buf + 10);
     uint16_t division = rd_be16(buf + 12);
     if (format > 1u) { tools_set_err(err, err_len, "midi_load: format %u unsupported (need 0 or 1)", (unsigned)format); goto fail; }
+    if (ntracks == 0u || (format == 0u && ntracks != 1u)) {
+        tools_set_err(err, err_len, "midi_load: invalid track count %u for format %u",
+                      (unsigned)ntracks, (unsigned)format);
+        goto fail;
+    }
     if (division & 0x8000u) { tools_set_err(err, err_len, "midi_load: SMPTE division unsupported"); goto fail; }
     if (division == 0u) { tools_set_err(err, err_len, "midi_load: zero division"); goto fail; }
 
     /* --- walk MTrk chunks --- */
     const uint8_t *p = buf + 8 + hlen;
-    const uint8_t *fend = buf + fsz;
-    uint32_t seq = 0;
+    const uint8_t *fend = buf + file_size;
+    uint64_t seq = 0;
     unsigned tracks_seen = 0;
-    while (p + 8 <= fend && tracks_seen < ntracks) {
+    while (tracks_seen < ntracks) {
+        if ((size_t)(fend - p) < 8u) {
+            tools_set_err(err, err_len, "midi_load: missing or truncated MTrk");
+            goto fail;
+        }
         if (memcmp(p, "MTrk", 4) != 0) { tools_set_err(err, err_len, "midi_load: expected MTrk"); goto fail; }
         uint32_t tlen = rd_be32(p + 4);
         const uint8_t *tstart = p + 8;
-        if (tstart + tlen > fend) { tools_set_err(err, err_len, "midi_load: MTrk overruns file"); goto fail; }
-        if (!parse_track(tstart, tstart + tlen, &evs, &seq, map->import_pitch_bend, err, err_len))
+        if ((size_t)(fend - tstart) < (size_t)tlen) {
+            tools_set_err(err, err_len, "midi_load: MTrk overruns file"); goto fail;
+        }
+        if (!parse_track(tstart, tstart + tlen, &evs, &seq,
+                         map->import_pitch_bend, err, err_len)) {
+            if (!err || err_len == 0 || err[0] == '\0')
+                tools_set_err(err, err_len, "midi_load: out of memory while parsing events");
             goto fail;
+        }
         p = tstart + tlen;
         tracks_seen++;
     }
@@ -339,12 +404,13 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
     unsigned rpb = map->rows_per_beat, tpr = map->ticks_per_row;
     unsigned chans = map->channels;
 
-    /* --- base tempo (first set-tempo, else 120 BPM) --- */
+    /* --- base tempo (last set-tempo at tick zero, else MIDI default 120 BPM).
+     * A first tempo event later in the file must remain a mid-song change. --- */
     uint32_t base_usec = 500000u;
-    size_t first_tempo_idx = (size_t)-1;
     const mev *events = evs.data;
     for (size_t i = 0; i < evs.len; i++) {
-        if (events[i].type == MEV_TEMPO) { base_usec = events[i].d3; first_tempo_idx = i; break; }
+        if (events[i].type == MEV_TEMPO && events[i].tick == 0)
+            base_usec = events[i].d3;
     }
     /* bpm_q8 = round(60e6 * 256 / usec) */
     uint32_t bpm_q8 = (uint32_t)(((uint64_t)60000000u * 256u + base_usec / 2u) / base_usec);
@@ -374,7 +440,11 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
 
     for (size_t i = 0; i < evs.len; i++) {
         const mev *e = &events[i];
-        uint64_t fine = to_fine(e->tick, rpb, tpr, division);
+        uint64_t fine;
+        if (!to_fine(e->tick, rpb, tpr, division, &fine)) {
+            tools_set_err(err, err_len, "midi_load: quantized timeline overflows uint64");
+            goto fail;
+        }
         if (fine > max_fine) max_fine = fine;
 
         if (e->type == MEV_PROGRAM) {
@@ -401,9 +471,13 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
                 placement *pl = vec_push(&places);
                 if (!pl) goto oom;
                 pl->col = (uint8_t)oldest;
+                pl->mchan = col_mchan[oldest];
                 pl->note = col_note[oldest]; pl->inst = col_inst[oldest]; pl->vol = col_vol[oldest];
                 pl->start_fine = col_start[oldest];
-                pl->end_fine = fine;
+                if (!normalize_note_end(pl->start_fine, fine, tpr, &pl->end_fine)) {
+                    tools_set_err(err, err_len, "midi_load: note duration overflows uint64");
+                    goto fail;
+                }
                 col = (int)oldest;
             }
             unsigned uc = (unsigned)col;
@@ -420,9 +494,13 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
                     placement *pl = vec_push(&places);
                     if (!pl) goto oom;
                     pl->col = (uint8_t)c;
+                    pl->mchan = col_mchan[c];
                     pl->note = col_note[c]; pl->inst = col_inst[c]; pl->vol = col_vol[c];
                     pl->start_fine = col_start[c];
-                    pl->end_fine = fine;
+                    if (!normalize_note_end(pl->start_fine, fine, tpr, &pl->end_fine)) {
+                        tools_set_err(err, err_len, "midi_load: note duration overflows uint64");
+                        goto fail;
+                    }
                     col_busy[c] = false;
                     break;
                 }
@@ -432,9 +510,14 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
     /* finalize any notes still held at end-of-song */
     for (unsigned c = 0; c < chans; c++) {
         if (col_busy[c]) {
+            if (max_fine > UINT64_MAX - tpr) {
+                tools_set_err(err, err_len, "midi_load: held-note end overflows uint64");
+                goto fail;
+            }
             placement *pl = vec_push(&places);
             if (!pl) goto oom;
             pl->col = (uint8_t)c;
+            pl->mchan = col_mchan[c];
             pl->note = col_note[c]; pl->inst = col_inst[c]; pl->vol = col_vol[c];
             pl->start_fine = col_start[c];
             pl->end_fine = max_fine + (uint64_t)tpr; /* ring to the next row */
@@ -449,16 +532,23 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
         for (size_t i = 0; i < places.len; i++)
             if (pls[i].end_fine > end_fine_max) end_fine_max = pls[i].end_fine;
     }
-    uint64_t total_rows64 = end_fine_max / (uint64_t)tpr + 1u;
-    if (total_rows64 > TOOLS_MAX_ROWS) {
-        tools_set_err(err, err_len, "midi_load: song too long (%llu rows)",
-                      (unsigned long long)total_rows64);
+    uint64_t last_row = end_fine_max / (uint64_t)tpr;
+    if (last_row >= TOOLS_MAX_ROWS) {
+        tools_set_err(err, err_len, "midi_load: song exceeds the %u-row limit",
+                      TOOLS_MAX_ROWS);
         goto fail;
     }
+    uint64_t total_rows64 = last_row + 1u;
     unsigned total_rows = (unsigned)total_rows64;
     unsigned rpp = map->rows_per_pattern;
     unsigned npat = (total_rows + rpp - 1u) / rpp;
     if (npat == 0) npat = 1;
+    if (npat > 256u) {
+        tools_set_err(err, err_len,
+                      "midi_load: %u patterns exceed the uint8 order limit; increase rows_per_pattern",
+                      npat);
+        goto fail;
+    }
     unsigned padded_rows = npat * rpp;
     size_t total_cells = (size_t)padded_rows * chans;
 
@@ -479,6 +569,11 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
             if (row_s >= padded_rows) continue;
             chipseq_cell *sc = &cells[(size_t)row_s * chans + pl->col];
             sc->note = pl->note; sc->inst = pl->inst; sc->vol = pl->vol;
+            /* A newly placed note supersedes any cut left in this cell by an
+             * older note that quantized onto the same chip column and grid
+             * position. Its own delay/cut is applied immediately below. */
+            sc->fx = CHIPSEQ_FX_NONE;
+            sc->fxp = 0;
             if (sub_s > 0) { sc->fx = CHIPSEQ_FX_NOTE_DELAY; sc->fxp = (uint8_t)sub_s; }
 
             if (pl->end_fine > pl->start_fine) {
@@ -486,7 +581,11 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
                 unsigned sub_e = (unsigned)(pl->end_fine % tpr);
                 if (row_e < padded_rows) {
                     chipseq_cell *ec = &cells[(size_t)row_e * chans + pl->col];
-                    if (ec->note == CHIPSEQ_NOTE_NONE && ec->fx == CHIPSEQ_FX_NONE) {
+                    if (row_e == row_s && sub_s == 0u && sub_e > 0u &&
+                        sc->fx == CHIPSEQ_FX_NONE) {
+                        sc->fx = CHIPSEQ_FX_NOTE_CUT;
+                        sc->fxp = (uint8_t)sub_e;
+                    } else if (ec->note == CHIPSEQ_NOTE_NONE && ec->fx == CHIPSEQ_FX_NONE) {
                         if (sub_e > 0) { ec->fx = CHIPSEQ_FX_NOTE_CUT; ec->fxp = (uint8_t)sub_e; }
                         else            { ec->note = CHIPSEQ_NOTE_CUT; }
                     }
@@ -495,14 +594,19 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
         }
     }
 
-    /* --- mid-song tempo changes -> FX_TEMPO, pitch bends -> FX_PORTA. The first
-     *     set-tempo already defined the song's base bpm_q8, so it is skipped;
-     *     every LATER tempo becomes an FX_TEMPO cell. --- */
+    /* --- mid-song tempo changes -> FX_TEMPO, pitch bends -> FX_PORTA. Tempo
+     * events at tick zero already define bpm_q8. Bends are attached only to
+     * chip columns carrying notes from the bend's MIDI channel. --- */
     for (size_t i = 0; i < evs.len; i++) {
         const mev *e = &events[i];
         if (e->type != MEV_TEMPO && e->type != MEV_BEND) continue;
-        if (e->type == MEV_TEMPO && i == first_tempo_idx) continue; /* the base */
-        uint64_t fine = to_fine(e->tick, rpb, tpr, division);
+        if (e->type == MEV_TEMPO && e->tick == 0) continue;
+        uint64_t fine;
+        if (!to_fine(e->tick, rpb, tpr, division, &fine)) {
+            free(cells);
+            tools_set_err(err, err_len, "midi_load: quantized automation overflows uint64");
+            goto fail;
+        }
         unsigned row = (unsigned)(fine / tpr);
         if (row >= padded_rows) continue;
 
@@ -512,7 +616,7 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
             if (bpm < 1u) bpm = 1u;
             if (bpm > 255u) bpm = 255u;
             fx = (uint8_t)CHIPSEQ_FX_TEMPO; fxp = (uint8_t)bpm;
-        } else { /* MEV_BEND -> FX_PORTA up/down (deterministic mapping) */
+        } else { /* MEV_BEND -> deterministic FX_PORTA up/down mapping */
             int delta = (int)e->d3 - 8192;
             if (delta == 0) continue;
             unsigned mag = (unsigned)(delta < 0 ? -delta : delta) >> 9;
@@ -521,14 +625,28 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
             fx = (uint8_t)(delta > 0 ? CHIPSEQ_FX_PORTA_UP : CHIPSEQ_FX_PORTA_DOWN);
             fxp = (uint8_t)mag;
         }
-        /* attach to the first fully-empty cell in this row (never clobber a note
-         * or an existing effect) */
-        for (unsigned c = 0; c < chans; c++) {
-            chipseq_cell *cc = &cells[(size_t)row * chans + c];
-            if (cc->note == CHIPSEQ_NOTE_NONE && cc->fx == CHIPSEQ_FX_NONE &&
-                cc->vol == CHIPSEQ_VOL_NONE) {
-                cc->fx = fx; cc->fxp = fxp;
-                break;
+        if (e->type == MEV_TEMPO) {
+            /* Tempo is global, so any free effect column on the row is valid;
+             * retaining note/volume data is safe because FX_TEMPO is orthogonal. */
+            for (unsigned c = 0; c < chans; c++) {
+                chipseq_cell *cc = &cells[(size_t)row * chans + c];
+                if (cc->fx == CHIPSEQ_FX_NONE) {
+                    cc->fx = fx; cc->fxp = fxp;
+                    break;
+                }
+            }
+        } else {
+            const placement *pls = places.data;
+            for (size_t pi = 0; pi < places.len; pi++) {
+                const placement *pl = &pls[pi];
+                if (pl->mchan != e->chan || fine < pl->start_fine ||
+                    fine >= pl->end_fine)
+                    continue;
+                chipseq_cell *cc = &cells[(size_t)row * chans + pl->col];
+                if (cc->fx == CHIPSEQ_FX_NONE) {
+                    cc->fx = fx;
+                    cc->fxp = fxp;
+                }
             }
         }
     }
@@ -629,15 +747,45 @@ static const char *PC_NAME[12] = {
     "C", "Cs", "D", "Ds", "E", "F", "Fs", "G", "Gs", "A", "As", "B"
 };
 
+static bool ident_first(unsigned char c) {
+    return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+static bool ident_rest(unsigned char c) {
+    return ident_first(c) || (c >= '0' && c <= '9');
+}
+
+static bool c_keyword(const char *s) {
+    static const char *const words[] = {
+        "_Alignas", "_Alignof", "_Atomic", "_Bool", "_Complex", "_Generic",
+        "_Imaginary", "_Noreturn", "_Static_assert", "_Thread_local",
+        "auto", "break", "case", "char", "const", "continue", "default", "do",
+        "double", "else", "enum", "extern", "float", "for", "goto", "if",
+        "inline", "int", "long", "register", "restrict", "return", "short",
+        "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+        "unsigned", "void", "volatile", "while"
+    };
+    for (size_t i = 0; i < sizeof words / sizeof words[0]; i++)
+        if (strcmp(s, words[i]) == 0) return true;
+    return false;
+}
+
+static bool valid_c_ident(const char *s) {
+    if (!s || !ident_first((unsigned char)s[0])) return false;
+    for (size_t i = 1; s[i] != '\0'; i++)
+        if (!ident_rest((unsigned char)s[i])) return false;
+    return !c_keyword(s);
+}
+
 static void emit_str_literal(FILE *f, const char *s) {
+    if (!s) { fputs("NULL", f); return; }
     fputc('"', f);
-    if (s) {
-        for (const char *q = s; *q; q++) {
-            unsigned char c = (unsigned char)*q;
-            if (c == '"' || c == '\\') { fputc('\\', f); fputc((int)c, f); }
-            else if (c >= 0x20 && c < 0x7F) { fputc((int)c, f); }
-            else { fprintf(f, "\\x%02X", (unsigned)c); }
-        }
+    for (const char *q = s; *q; q++) {
+        unsigned char c = (unsigned char)*q;
+        if (c == '"' || c == '\\') { fputc('\\', f); fputc((int)c, f); }
+        else if (c == '?') { fputs("\\?", f); } /* cannot form a C11 trigraph */
+        else if (c >= 0x20 && c < 0x7F) { fputc((int)c, f); }
+        else { fprintf(f, "\\%03o", (unsigned)c); }
     }
     fputc('"', f);
 }
@@ -705,6 +853,10 @@ bool chipseq_song_write_c(const chipseq_song *song, const char *path,
     if (!song)  { tools_set_err(err, err_len, "write_c: NULL song");  return false; }
     if (!path)  { tools_set_err(err, err_len, "write_c: NULL path");  return false; }
     if (!ident) { tools_set_err(err, err_len, "write_c: NULL ident"); return false; }
+    if (!valid_c_ident(ident)) {
+        tools_set_err(err, err_len, "write_c: '%s' is not a valid non-keyword C identifier", ident);
+        return false;
+    }
 
     char verr[160];
     if (!chipseq_song_validate(song, verr, sizeof verr)) {
@@ -757,34 +909,36 @@ bool chipseq_song_write_c(const chipseq_song *song, const char *path,
         }
     }
 
-    fprintf(f, "static const chipseq_instrument %s_insts[] = {\n", ident);
-    for (unsigned i = 0; i < song->instrument_count; i++) {
-        const chipseq_instrument *it = &in[i];
-        fprintf(f, "    { ");
-        fprintf(f, ".name = ");
-        emit_str_literal(f, it->name);
-        fprintf(f, ", .wave = %s",
-                it->wave < 6u ? WAVE_NAME[it->wave] : "CHIPSEQ_WAVE_PULSE");
-        if (it->duty)       fprintf(f, ", .duty = %u", (unsigned)it->duty);
-        if (it->noise_mode) fprintf(f, ", .noise_mode = %s",
-                                    it->noise_mode < 2u ? NOISE_NAME[it->noise_mode] : NOISE_NAME[0]);
-        if (it->tri_steps)  fprintf(f, ", .tri_steps = %u", (unsigned)it->tri_steps);
-        if (it->vol_seq)    fprintf(f, ", .vol_seq = &%s_vol%u", ident, i);
-        if (it->arp_seq)    fprintf(f, ", .arp_seq = &%s_arp%u", ident, i);
-        if (it->pitch_seq)  fprintf(f, ", .pitch_seq = &%s_pitch%u", ident, i);
-        if (it->duty_seq)   fprintf(f, ", .duty_seq = &%s_duty%u", ident, i);
-        if (it->wave == CHIPSEQ_WAVE_WAVETABLE && it->wavetable)
-            fprintf(f, ", .wavetable = %s_wt%u", ident, i);
-        if (it->wave == CHIPSEQ_WAVE_PCM && it->pcm)
-            fprintf(f, ", .pcm = &%s_pcm%u", ident, i);
-        if (it->transpose)  fprintf(f, ", .transpose = %d", (int)it->transpose);
-        if (it->finetune)   fprintf(f, ", .finetune = %d", (int)it->finetune);
-        if (it->vib_speed)  fprintf(f, ", .vib_speed = %u", (unsigned)it->vib_speed);
-        if (it->vib_depth)  fprintf(f, ", .vib_depth = %u", (unsigned)it->vib_depth);
-        if (it->vib_delay)  fprintf(f, ", .vib_delay = %u", (unsigned)it->vib_delay);
-        fprintf(f, " },\n");
+    if (song->instrument_count > 0) {
+        fprintf(f, "static const chipseq_instrument %s_insts[] = {\n", ident);
+        for (unsigned i = 0; i < song->instrument_count; i++) {
+            const chipseq_instrument *it = &in[i];
+            fprintf(f, "    { ");
+            fprintf(f, ".name = ");
+            emit_str_literal(f, it->name);
+            fprintf(f, ", .wave = %s",
+                    it->wave < 6u ? WAVE_NAME[it->wave] : "CHIPSEQ_WAVE_PULSE");
+            if (it->duty)       fprintf(f, ", .duty = %u", (unsigned)it->duty);
+            if (it->noise_mode) fprintf(f, ", .noise_mode = %s",
+                                        it->noise_mode < 2u ? NOISE_NAME[it->noise_mode] : NOISE_NAME[0]);
+            if (it->tri_steps)  fprintf(f, ", .tri_steps = %u", (unsigned)it->tri_steps);
+            if (it->vol_seq)    fprintf(f, ", .vol_seq = &%s_vol%u", ident, i);
+            if (it->arp_seq)    fprintf(f, ", .arp_seq = &%s_arp%u", ident, i);
+            if (it->pitch_seq)  fprintf(f, ", .pitch_seq = &%s_pitch%u", ident, i);
+            if (it->duty_seq)   fprintf(f, ", .duty_seq = &%s_duty%u", ident, i);
+            if (it->wave == CHIPSEQ_WAVE_WAVETABLE && it->wavetable)
+                fprintf(f, ", .wavetable = %s_wt%u", ident, i);
+            if (it->wave == CHIPSEQ_WAVE_PCM && it->pcm)
+                fprintf(f, ", .pcm = &%s_pcm%u", ident, i);
+            if (it->transpose)  fprintf(f, ", .transpose = %d", (int)it->transpose);
+            if (it->finetune)   fprintf(f, ", .finetune = %d", (int)it->finetune);
+            if (it->vib_speed)  fprintf(f, ", .vib_speed = %u", (unsigned)it->vib_speed);
+            if (it->vib_depth)  fprintf(f, ", .vib_depth = %u", (unsigned)it->vib_depth);
+            if (it->vib_delay)  fprintf(f, ", .vib_delay = %u", (unsigned)it->vib_delay);
+            fprintf(f, " },\n");
+        }
+        fprintf(f, "};\n\n");
     }
-    fprintf(f, "};\n\n");
 
     /* patterns */
     for (unsigned pi = 0; pi < song->pattern_count; pi++) {
@@ -818,8 +972,11 @@ bool chipseq_song_write_c(const chipseq_song *song, const char *path,
     fprintf(f, "    .name = ");
     emit_str_literal(f, song->name);
     fprintf(f, ",\n");
-    fprintf(f, "    .instruments = %s_insts, .instrument_count = %u,\n",
-            ident, (unsigned)song->instrument_count);
+    if (song->instrument_count > 0)
+        fprintf(f, "    .instruments = %s_insts, .instrument_count = %u,\n",
+                ident, (unsigned)song->instrument_count);
+    else
+        fprintf(f, "    .instruments = NULL, .instrument_count = 0,\n");
     fprintf(f, "    .patterns = %s_patterns, .pattern_count = %u,\n",
             ident, (unsigned)song->pattern_count);
     fprintf(f, "    .order = %s_order, .order_length = %u,\n",
@@ -834,6 +991,8 @@ bool chipseq_song_write_c(const chipseq_song *song, const char *path,
     fprintf(f, "    .bpm_q8 = %u,\n", (unsigned)song->bpm_q8);
     fprintf(f, "};\n");
 
-    if (fclose(f) != 0) { tools_set_err(err, err_len, "write_c: write/close failed"); return false; }
+    bool write_ok = ferror(f) == 0;
+    if (fclose(f) != 0) write_ok = false;
+    if (!write_ok) { tools_set_err(err, err_len, "write_c: write/close failed"); return false; }
     return true;
 }

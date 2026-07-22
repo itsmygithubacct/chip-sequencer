@@ -3,3 +3,6 @@
 *.a
 *.so
 *.wav
+*.plist
+/chipseq_tools_*.mid
+/chipseq_tools_out*.c

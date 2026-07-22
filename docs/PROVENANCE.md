@@ -16,13 +16,16 @@ this repository's own.
 
 ## The determinism contract
 
-Byte-reproducibility is the library's load-bearing guarantee and is enforced as a
-build-breaking test. For a fixed `(song, options, sample_rate)`,
-`chipseq_render_song` produces byte-identical output on any machine, any build,
-forever. This is what lets a consuming game pin a golden hash of its audio.
+Sample reproducibility is the library's load-bearing guarantee and is enforced
+as a build-breaking test. For a fixed `(song, options, sample_rate)`,
+`chipseq_render_song` produces the same signed int16 sample sequence on every
+supported target and for every caller block partition. In-memory int16 byte
+order is native; serialized WAV and golden-hash bytes are little-endian.
 
-It holds because the render path contains **zero** transcendental functions
-(`sin`, `exp`, `pow`, `tanh`) — only correctly-rounded IEEE `+ - * /`:
+It holds because supported targets must provide 32-bit always-lock-free
+`atomic_uint` and binary floating point with sufficient precision (enforced at
+compile time), and because the render path contains **zero** libm or
+transcendental functions (`sin`, `exp`, `pow`, `tanh`):
 
 - Integer fixed point end to end: a `uint32_t` Q32 phase accumulator, 0..64
   integer volume, and 1/16-semitone integer detune. Nothing in the per-sample
@@ -32,31 +35,37 @@ It holds because the render path contains **zero** transcendental functions
 - Table-driven waveforms, a 15-bit LFSR with pinned feedback taps, and a static
   64-entry integer triangle LFO for vibrato and tremolo — no `sin`.
 - Envelopes, arpeggios, pitch, and duty modulation advance one step per tick with
-  a 64-bit remainder accumulator, so row timing is exact and identical across
-  sample rates.
+  a 64-bit remainder accumulator, so the musical tick sequence is identical
+  across sample rates and frame positions scale to within one output sample.
+- Operations that need a signed power-of-two scale use explicit, defined floor
+  division rather than implementation-defined right shifts of negative values.
 - Float output is defined as exactly `int16 * (1.0f / 32768.0f)` — a power of two
-  — so `render_f32` and `render_s16` can never diverge, and the library builds
-  with `-ffp-contract=off` so no fused multiply-add perturbs that one multiply.
+  exactly representable on supported targets — so `render_f32` and `render_s16`
+  cannot diverge. The library builds with `-ffp-contract=off`.
 - Oversampling (default 2x) with a fixed integer halfband-FIR decimation stage is
   part of the byte contract, as is every table and the oversample factor.
 
 ## Threading and scope
 
-Every control entry point (`chipseq_music_play`, `chipseq_sfx_play`, and the
-setters) is a push onto a lock-free single-producer/single-consumer command ring
-that the *foreign* mixer thread drains at block start. The render callback is
-fast, lock-free, non-blocking, and never calls back into the API. The library
-owns no thread, no device, and no pipe; the scope boundary against a transport
-mixer is described in full in [../README.md](../README.md).
+Playback and gain controls push onto a lock-free single-producer/single-consumer
+command ring that the *foreign* mixer thread drains at block start. Master
+enable is an always-lock-free atomic flag, and playhead/SFX-status queries read
+atomic publication state. The render callback is fast, lock-free, non-blocking,
+and never calls back into the API. The library owns no thread, no device, and no
+pipe; the scope boundary against a transport mixer is described in full in
+[../README.md](../README.md).
 
 ## Verification
 
 - `make test` — the headless unit suite plus the golden-hash determinism gate:
   `chipseq_song_validate` rejects every out-of-bounds construction with a message
   naming the pattern, row, and channel; `render_f32` equals `render_s16 / 32768`
-  sample-for-sample; queued commands apply exactly at block boundaries; and the
-  md5 of the reference song render is reproduced byte-for-byte.
+  sample-for-sample; queued commands apply exactly at block boundaries; renders
+  are invariant to caller block partitioning; and the FNV-1a hash of the
+  reference song render is reproduced byte-for-byte.
 - `make sanitize` — the same suite under AddressSanitizer and
   UndefinedBehaviorSanitizer.
+- `make tsanitize` — concurrent render/playhead publication under
+  ThreadSanitizer.
 
 No audio hardware is touched by any test.

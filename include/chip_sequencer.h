@@ -8,31 +8,51 @@
  *
  * It owns no thread, no device, no pipe, and does NOT mix foreign clips,
  * resample foreign WAVs, pace a transport, or crossfade tracks -- pcm-mixer
- * does all of that. Control calls run on the game thread and are applied at
- * block boundaries through a lock-free single-producer/single-consumer queue,
- * so it is safe to drive while a mixer thread renders.
+ * does all of that. Queued control calls run on the game thread and are applied
+ * at block boundaries through a lock-free single-producer/single-consumer
+ * queue; the master enable flag is a direct atomic control. Both are safe while
+ * a mixer thread renders.
  *
  * Determinism is a hard invariant: the entire signal path is integer fixed
  * point with zero libm calls; float output is defined as int16 * (1/32768).
- * Same song + same options + same sample rate = byte-identical output, forever.
+ * Same song + same options + same sample rate = identical signed PCM sample
+ * values on every supported target. Serialized PCM/WAV bytes are little-endian.
  *
- * Language: ISO C11. Dependencies: only <stdatomic.h> beyond freestanding C11.
+ * Language: ISO C11 (C translation units only). Dependencies: the C11
+ * standard library only. Supported targets provide 32-bit always-lock-free
+ * atomic_uint and binary float.
  * MIT licensed.
  */
 #ifndef CHIP_SEQUENCER_H
 #define CHIP_SEQUENCER_H
 
+#ifdef __cplusplus
+#error "chip-sequencer is a C11-only header; compile it in a C translation unit"
+#else
+
+#include <float.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#ifdef __cplusplus
-extern "C" {
+/* The render callback's lock-free guarantee is part of the API, not a hopeful
+ * property of a particular compiler runtime. All cross-thread state therefore
+ * uses atomic_uint, and unsupported targets fail at compile time instead of
+ * silently lowering an atomic operation to a hidden lock/libatomic call. */
+#if UINT_MAX != UINT32_MAX
+#error "chip-sequencer requires a 32-bit unsigned int"
+#endif
+#if ATOMIC_INT_LOCK_FREE != 2
+#error "chip-sequencer requires always-lock-free 32-bit atomics"
+#endif
+#if FLT_RADIX != 2 || FLT_MANT_DIG < 16
+#error "chip-sequencer requires binary float with at least 16 mantissa bits"
 #endif
 
 #define CHIPSEQ_VERSION_MAJOR 0
-#define CHIPSEQ_VERSION_MINOR 1
+#define CHIPSEQ_VERSION_MINOR 2
 #define CHIPSEQ_VERSION_PATCH 0
 
 /* --- hard capacity limits baked into the object (nothing allocates) ------ */
@@ -159,9 +179,9 @@ typedef struct chipseq_pcm {
 typedef struct chipseq_instrument {
     const char *name;              /* optional, for tools/debug only */
     uint8_t wave;                  /* chipseq_wave */
-    uint8_t duty;                  /* pulse/saw duty in 1/64ths, 1..63 */
+    uint8_t duty;                  /* pulse/saw control, 0 = default; else 1..63 */
     uint8_t noise_mode;            /* chipseq_noise_mode */
-    uint8_t tri_steps;             /* triangle quantization; 0 = smooth, 32 = NES */
+    uint8_t tri_steps;             /* triangle quantization; 0 = smooth, else 4..255 */
     const chipseq_seq *vol_seq;    /* 0..64 gain per tick */
     const chipseq_seq *arp_seq;    /* signed semitone offset per tick */
     const chipseq_seq *pitch_seq;  /* signed 1/16-semitone detune per tick */
@@ -172,7 +192,7 @@ typedef struct chipseq_instrument {
     int16_t  finetune;            /* 1/16-semitone constant detune */
     uint8_t  vib_speed;            /* per-instrument auto-vibrato (0 = off) */
     uint8_t  vib_depth;
-    uint8_t  vib_delay;            /* ticks before auto-vibrato ramps in */
+    uint8_t  vib_delay;            /* ticks before auto-vibrato begins */
 } chipseq_instrument;
 
 typedef struct chipseq_cell {
@@ -180,7 +200,7 @@ typedef struct chipseq_cell {
     uint8_t inst;  /* instrument index (used only when note is a real note) */
     uint8_t vol;   /* 0..64, or CHIPSEQ_VOL_NONE */
     uint8_t fx;    /* chipseq_fx */
-    uint8_t fxp;   /* effect parameter */
+    uint8_t fxp;   /* effect-specific parameter; see README "Effect parameters" */
 } chipseq_cell;
 
 /* Row-major cell grid: cells[row * song->channels + channel]. */
@@ -227,10 +247,10 @@ typedef struct chipseq_voice {   /* private */
     uint32_t lfsr;
     const chipseq_instrument *inst;
     uint16_t seq_pos[4];
+    uint32_t note_ticks;         /* ticks elapsed since the last trigger */
     int32_t  cur_pitch;          /* fixed-point running pitch */
-    uint64_t pcm_pos;            /* Q16 position into PCM frames (64-bit so long
-                                    non-looping samples never wrap; frame_count
-                                    is 32-bit, so idx = pcm_pos>>16 always fits) */
+    uint64_t pcm_pos;            /* Q16 position into PCM frames; bounds are
+                                    checked in 64-bit before narrowing an index */
     uint8_t  note, vol, duty;
     uint8_t  active, released, pan;
 } chipseq_voice;
@@ -243,7 +263,7 @@ typedef struct chipseq_track {   /* private: one music/sfx playhead */
     uint8_t  tick, ticks_per_row;
     uint16_t bpm_q8;
     uint16_t fade_ticks, fade_left;
-    uint16_t generation;
+    uint32_t generation;
     uint8_t  channels, first_voice;
     uint8_t  active, looping, paused;
 } chipseq_track;
@@ -251,21 +271,18 @@ typedef struct chipseq_track {   /* private: one music/sfx playhead */
 typedef struct chipseq_cmd {     /* private: one queued control command */
     uint8_t  op;
     uint8_t  slot;
-    uint16_t generation;
+    uint16_t pad0;
+    uint32_t generation;
     int32_t  ia, ib;
     float    fa;
     const chipseq_song *song;
     uint8_t  loop, pad[3];
 } chipseq_cmd;
 
-typedef struct chipseq_snapshot {/* private: published render-thread state */
-    uint16_t order_pos, row;
-    uint8_t  tick;
-    uint8_t  music_active;
-} chipseq_snapshot;
-/* NB: SFX liveness is NOT published here. It is carried by the per-slot atomic
- * claim words (sfx_claim[], below), which are the authoritative cross-thread
- * SFX state; a snapshot mask would only ever be one block stale. */
+/* NB: SFX liveness is not included in the playhead snapshot. It is carried by
+ * the per-slot atomic claim words (sfx_claim[], below), which are the
+ * authoritative cross-thread SFX state; a snapshot mask would only ever be
+ * one block stale. */
 
 typedef struct chipseq {
     /* private: use the API below. */
@@ -280,33 +297,35 @@ typedef struct chipseq {
     uint16_t voice_generation;
     /* render-thread-private streaming filter state. These PERSIST across render
      * blocks so the halfband decimation FIR and the one-pole lowpass are true
-     * streaming filters: the output for a (song, options, sample_rate) is then
-     * byte-identical regardless of block size, and no transient is injected at
-     * block boundaries. Zeroed once at chipseq_init; never reset per block. */
+     * streaming filters: the signed sample sequence for a
+     * (song, options, sample_rate) is identical regardless of block size, and
+     * no transient is injected at block boundaries. Zeroed once at
+     * chipseq_init; never reset per block. */
     int32_t dec_z0[15], dec_z1[15];              /* mono decimation delay lines */
     int32_t dec_z0l[15], dec_z1l[15];            /* stereo L decimation lines   */
     int32_t dec_z0r[15], dec_z1r[15];            /* stereo R decimation lines   */
     int32_t lp_mono, lp_l, lp_r;                 /* one-pole lowpass accumulators */
-    /* Per-SFX-slot atomic claim word: the SPSC handshake for slot ownership.
-     * Packs {state:2 (FREE / CLAIMED / PLAYING / LOOPING), generation:14,
-     * claim_ordinal:48}. The game thread CAS-claims a FREE slot (or steals the
-     * oldest PLAYING one); the render thread CAS-transitions CLAIMED->PLAYING
-     * and PLAYING/LOOPING->FREE on song-end. Because state, generation and the
-     * age ordinal share one word, a claim, a steal, or a release is a single
-     * CAS -- neither thread ever reads the other's plain sfx[] fields to decide
-     * ownership, and there is no reliance on the (stale) snapshot. */
-    _Atomic uint64_t sfx_claim[CHIPSEQ_SFX_SLOTS];
-    _Atomic uint64_t sfx_claim_next; /* game thread: monotonic claim-ordinal source */
+    /* Per-SFX-slot atomic claim word: state in bits 31..30 and a non-wrapping
+     * 29-bit generation in bits 28..0. Slots retire on generation exhaustion,
+     * so a stale public handle cannot become valid again during one engine
+     * lifetime. Claim ordinals are game-thread-private: the render thread never
+     * reads them, so they need no atomic operation. */
+    atomic_uint sfx_claim[CHIPSEQ_SFX_SLOTS];
+    uint64_t sfx_claim_next;
+    uint64_t sfx_claim_ordinal[CHIPSEQ_SFX_SLOTS];
     /* lock-free SPSC command ring (game thread -> render thread) */
     chipseq_cmd  queue[CHIPSEQ_CMD_QUEUE];
-    _Atomic uint32_t queue_head;   /* producer (game thread) */
-    _Atomic uint32_t queue_tail;   /* consumer (render thread) */
-    /* render-thread-published snapshot (game thread reads it) */
-    _Atomic uint32_t snap_seq;     /* seqlock counter */
-    chipseq_snapshot snap;
+    atomic_uint queue_head;   /* producer (game thread) */
+    atomic_uint queue_tail;   /* consumer (render thread) */
+    /* Coherent render-thread-published playhead. Sequentially consistent atomic
+     * payload words make this seqlock data-race-free; snap_seq is odd only
+     * during the bounded publish. */
+    atomic_uint snap_seq;
+    atomic_uint snap_position; /* high 16: row, low 16: order_pos */
+    atomic_uint snap_state;    /* bit 8: music_active, low 8: tick */
     /* Master mute: a runtime control, so an atomic flag written directly by the
      * game thread (NOT via the command queue) and loaded by both threads. */
-    _Atomic bool enabled;
+    atomic_uint enabled;
     bool offline, initialized;     /* write-once at init; read-only afterward */
 } chipseq;
 
@@ -341,15 +360,18 @@ bool chipseq_is_enabled(const chipseq *seq);
 /* ======================================================================== */
 
 /* Validate every order entry, instrument reference, sequence loop/release
- * index, PCM loop point, and channel count. On the first problem writes a
+ * index and value range, waveform parameter/table, PCM body/loop point, cell
+ * value/effect, tempo field, and channel count. On the first problem writes a
  * message naming the offending pattern/row/channel/instrument into err (when
  * err_len > 0) and returns false. music/sfx play call this internally. */
 bool chipseq_song_validate(const chipseq_song *song, char *err, size_t err_len);
 
-/* Exact number of output frames the song renders at sample rate `sr`,
+/* Exact number of output frames the song renders at sample rate `sr`
+ * (8000..192000),
  * including FX_SPEED/FX_TEMPO, up to (and not past) its loop point; returns
- * UINT64_MAX for an infinitely-looping song. Uses the same fixed-point tick
- * math as the renderer, so it is exact, not an estimate. */
+ * UINT64_MAX for an infinitely-looping song or an unrepresentable finite
+ * length. Uses the same fixed-point tick math as the renderer, so it is exact,
+ * not an estimate. */
 uint64_t chipseq_song_frames(const chipseq_song *song, uint32_t sr);
 
 /* ======================================================================== */
@@ -366,14 +388,15 @@ bool chipseq_music_play(chipseq *seq, const chipseq_song *song, bool loop,
 /* Fade music out over fade_ticks sequencer ticks (0 = stop immediately). */
 bool chipseq_music_stop(chipseq *seq, uint16_t fade_ticks);
 
-/* Live music gain, 0..1. */
+/* Live music gain, 0..1. Non-finite/out-of-range values are rejected. */
 bool chipseq_music_set_volume(chipseq *seq, float volume);
 
 /* Pause/resume music (voices hold; the playhead freezes). */
 bool chipseq_music_set_paused(chipseq *seq, bool paused);
 
 /* Read the last-published playhead position (may be one block stale, never
- * torn). Any out pointer may be NULL. Returns false when no music is playing. */
+ * torn). Any out pointer may be NULL. Returns false when no music is playing
+ * or when a bounded read cannot beat a concurrent publication. */
 bool chipseq_music_position(const chipseq *seq, uint16_t *order_pos,
                             uint16_t *row, uint8_t *tick);
 
@@ -392,9 +415,10 @@ int  chipseq_sfx_play(chipseq *seq, const chipseq_song *song, float vol,
 /* Live-adjust a playing SFX (rev an engine loop). Stale handle -> false. */
 bool chipseq_sfx_set(chipseq *seq, int handle, float vol, int transpose);
 
-/* Stop one SFX / all SFX. */
+/* Stop one SFX / all SFX. A false stop-all result means the command queue is
+ * full (or the engine is not initialized), so the caller can retry. */
 bool chipseq_sfx_stop(chipseq *seq, int handle);
-void chipseq_sfx_stop_all(chipseq *seq);
+bool chipseq_sfx_stop_all(chipseq *seq);
 
 /* True while the handle still names a live SFX. */
 bool chipseq_sfx_active(const chipseq *seq, int handle);
@@ -428,13 +452,14 @@ void chipseq_flush_commands(chipseq *seq);
 /* offline bounce                                                           */
 /* ======================================================================== */
 
-/* Render a whole song to a fresh malloc'd mono s16 buffer at options->sample
- * _rate. Stops at the song's natural end, or after max_frames (0 = use
- * chipseq_song_frames; a looping song REQUIRES a nonzero max_frames).
- * *out_frames receives the frame count. Returns NULL with a reason in err on
- * OOM / invalid song / infinite song with max_frames == 0. Free with
- * chipseq_pcm_free. The result is accepted verbatim by pcmmix_wav-style mono
- * consumers. */
+/* Render a whole song to a fresh malloc'd mono s16 buffer at
+ * options->sample_rate. max_frames is an upper bound: a finite song may end
+ * sooner, while a looping song renders through its declared loop until the
+ * bound and therefore REQUIRES max_frames != 0. With max_frames == 0, a finite
+ * song uses chipseq_song_frames(). *out_frames receives the frame count and is
+ * set to zero on failure. Returns NULL with a reason in err on OOM, invalid
+ * input, an unrepresentable allocation, or an unbounded looping render. Free
+ * with chipseq_pcm_free. */
 int16_t *chipseq_render_song(const chipseq_song *song,
                              const chipseq_options *options,
                              uint64_t max_frames, size_t *out_frames,
@@ -443,9 +468,10 @@ int16_t *chipseq_render_song(const chipseq_song *song,
 /* Free a buffer from chipseq_render_song. NULL allowed. */
 void chipseq_pcm_free(int16_t *frames);
 
-/* Bounce a song straight to a canonical PCM/mono/16-bit WAV at options->sample
- * _rate -- the inverse of a strict WAV loader. Returns false with a reason in
- * err on failure. */
+/* Bounce a song straight to a canonical little-endian PCM/mono/16-bit WAV at
+ * options->sample_rate -- the inverse of a strict WAV loader. Files exceeding
+ * the 32-bit RIFF size limit are rejected before rendering. Returns false with
+ * a reason in err on failure. */
 bool chipseq_bounce_wav(const chipseq_song *song, const chipseq_options *options,
                         const char *path, uint64_t max_frames,
                         char *err, size_t err_len);
@@ -475,7 +501,8 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
 /* Free a song returned by chipseq_midi_load. NEVER call on a static literal. */
 void chipseq_song_free(chipseq_song *song);
 
-/* Emit diff-stable, self-contained C song literals named `ident` to `path`. */
+/* Emit diff-stable, self-contained C song literals named `ident` to `path`.
+ * ident must be a non-keyword C11 identifier. */
 bool chipseq_song_write_c(const chipseq_song *song, const char *path,
                           const char *ident, char *err, size_t err_len);
 
@@ -489,8 +516,6 @@ uint8_t chipseq_nes_noise_note(unsigned index);
 /* Human-readable effect name ("VIBRATO", ...) for tools/debug. */
 const char *chipseq_fx_name(chipseq_fx fx);
 
-#ifdef __cplusplus
-}
-#endif
+#endif /* !__cplusplus */
 
 #endif /* CHIP_SEQUENCER_H */

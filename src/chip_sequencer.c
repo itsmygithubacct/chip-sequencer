@@ -1,11 +1,10 @@
 /* chip_sequencer.c -- deterministic chiptune synth + pattern sequencer (core).
  *
- * POSIX-free: beyond freestanding C11 this uses only <stdatomic.h> for the
- * cross-thread handshakes, <string.h> for memcpy/memset/memmove, and -- for the
- * OFFLINE bounce helpers ONLY -- ISO C <stdlib.h> (malloc/free) and <stdio.h>
- * (WAV file write). No <math.h>: the whole render path is integer fixed point
- * with zero libm transcendentals, so a song renders byte-identically forever
- * (see the byte-contract constants below).
+ * POSIX-free: this uses only the C11 standard library. The offline bounce
+ * helpers use malloc/free and standard file I/O; the live render path does not
+ * allocate or perform I/O. No <math.h>: the signal path is integer fixed point
+ * with zero libm transcendentals, so supported targets produce the same signed
+ * sample sequence (see the pinned-contract constants below).
  *
  * The header struct is the fixed public ABI; several private track fields are
  * deliberately reused (documented at each use) because the struct is minimal by
@@ -19,7 +18,7 @@
 #include <string.h>
 
 /* ======================================================================== */
-/* Pinned byte-contract constants. Changing any of these is a         */
+/* Pinned sample-contract constants. Changing any of these is a              */
 /* deliberate golden rehash, never an accident.                              */
 /* ======================================================================== */
 
@@ -100,6 +99,9 @@ enum {
 /* SFX claim-word states (2 bits). */
 enum { ST_FREE = 0, ST_CLAIMED = 1, ST_PLAYING = 2, ST_LOOPING = 3 };
 
+#define CLAIM_STATE_SHIFT 30u
+#define CLAIM_GEN_MASK    0x1FFFFFFFu
+
 /* Sequence index mapping in voice->seq_pos[]. */
 enum { SEQ_VOL = 0, SEQ_ARP = 1, SEQ_PITCH = 2, SEQ_DUTY = 3 };
 
@@ -119,11 +121,40 @@ static int16_t clamp16(int32_t v) {
     return (int16_t)v;
 }
 
+/* ISO C leaves right-shifting a negative signed value implementation-defined.
+ * The sample contract uses the arithmetic-shift result (division by 2^n rounded
+ * toward negative infinity), so express that operation with defined arithmetic. */
+static int64_t floor_shift_i64(int64_t value, unsigned shift) {
+    uint64_t divisor = (uint64_t)1u << shift;
+    if (value >= 0) return value / (int64_t)divisor;
+    uint64_t magnitude = (uint64_t)(-(value + 1)) + 1u;
+    uint64_t quotient = (magnitude + divisor - 1u) / divisor;
+    return -(int64_t)quotient;
+}
+
+static int32_t saturating_add_i32(int32_t value, int32_t delta) {
+    int64_t sum = (int64_t)value + delta;
+    if (sum > INT32_MAX) return INT32_MAX;
+    if (sum < INT32_MIN) return INT32_MIN;
+    return (int32_t)sum;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+static void set_err(char *err, size_t err_len, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+#endif
 static void set_err(char *err, size_t err_len, const char *fmt, ...) {
     if (!err || err_len == 0) return;
     va_list ap;
     va_start(ap, fmt);
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+#endif
     (void)vsnprintf(err, err_len, fmt, ap);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
     va_end(ap);
 }
 
@@ -218,17 +249,14 @@ static bool queue_push(chipseq *seq, const chipseq_cmd *cmd) {
 /* SFX claim words                                                           */
 /* ======================================================================== */
 
-static uint64_t claim_pack(unsigned state, uint16_t gen, uint64_t ord) {
-    return ((uint64_t)(state & 3u) << 62)
-         | ((uint64_t)(gen & 0x3FFFu) << 48)
-         | (ord & 0xFFFFFFFFFFFFULL);
+static unsigned claim_pack(unsigned state, uint32_t gen) {
+    return ((state & 3u) << CLAIM_STATE_SHIFT) | (gen & CLAIM_GEN_MASK);
 }
-static unsigned claim_state(uint64_t w) { return (unsigned)(w >> 62); }
-static uint16_t claim_gen(uint64_t w)   { return (uint16_t)((w >> 48) & 0x3FFFu); }
-static uint64_t claim_ord(uint64_t w)   { return w & 0xFFFFFFFFFFFFULL; }
+static unsigned claim_state(unsigned w) { return w >> CLAIM_STATE_SHIFT; }
+static uint32_t claim_gen(unsigned w)    { return (uint32_t)(w & CLAIM_GEN_MASK); }
 
-static int handle_encode(unsigned slot, uint16_t gen) {
-    return (int)(((uint32_t)gen << 2) | (slot & 3u));
+static int handle_encode(unsigned slot, uint32_t gen) {
+    return (int)((gen << 2) | (slot & 3u));
 }
 
 /* Game thread: claim a FREE slot, else steal the oldest PLAYING one. Returns a
@@ -237,43 +265,47 @@ static int sfx_try_claim(chipseq *seq) {
     for (int attempt = 0; attempt < 128; attempt++) {
         int free_slot = -1;
         for (unsigned i = 0; i < CHIPSEQ_SFX_SLOTS; i++) {
-            uint64_t w = atomic_load_explicit(&seq->sfx_claim[i], memory_order_acquire);
-            if (claim_state(w) == ST_FREE) { free_slot = (int)i; break; }
+            unsigned w = atomic_load_explicit(&seq->sfx_claim[i], memory_order_acquire);
+            if (claim_state(w) == ST_FREE && claim_gen(w) < CLAIM_GEN_MASK) {
+                free_slot = (int)i;
+                break;
+            }
         }
         if (free_slot >= 0) {
             unsigned i = (unsigned)free_slot;
-            uint64_t w = atomic_load_explicit(&seq->sfx_claim[i], memory_order_acquire);
-            if (claim_state(w) != ST_FREE) continue;
-            uint16_t gen = (uint16_t)((claim_gen(w) + 1u) & 0x3FFFu);
-            if (gen == 0) gen = 1;
-            uint64_t ord = atomic_fetch_add_explicit(&seq->sfx_claim_next, 1u,
-                                                     memory_order_relaxed);
-            uint64_t nw = claim_pack(ST_CLAIMED, gen, ord);
+            unsigned w = atomic_load_explicit(&seq->sfx_claim[i], memory_order_acquire);
+            if (claim_state(w) != ST_FREE || claim_gen(w) >= CLAIM_GEN_MASK) continue;
+            uint32_t gen = claim_gen(w) + 1u;
+            uint64_t ord = seq->sfx_claim_next++;
+            unsigned nw = claim_pack(ST_CLAIMED, gen);
             if (atomic_compare_exchange_strong_explicit(&seq->sfx_claim[i], &w, nw,
-                    memory_order_acq_rel, memory_order_acquire))
+                    memory_order_acq_rel, memory_order_acquire)) {
+                seq->sfx_claim_ordinal[i] = ord;
                 return handle_encode(i, gen);
+            }
             continue;   /* lost race, rescan */
         }
         /* no free slot: steal the oldest PLAYING (never LOOPING/CLAIMED) */
         int victim = -1;
-        uint64_t best_ord = UINT64_MAX, victim_w = 0;
+        uint64_t best_ord = UINT64_MAX;
+        unsigned victim_w = 0;
         for (unsigned i = 0; i < CHIPSEQ_SFX_SLOTS; i++) {
-            uint64_t w = atomic_load_explicit(&seq->sfx_claim[i], memory_order_acquire);
-            if (claim_state(w) == ST_PLAYING) {
-                uint64_t o = claim_ord(w);
+            unsigned w = atomic_load_explicit(&seq->sfx_claim[i], memory_order_acquire);
+            if (claim_state(w) == ST_PLAYING && claim_gen(w) < CLAIM_GEN_MASK) {
+                uint64_t o = seq->sfx_claim_ordinal[i];
                 if (o < best_ord) { best_ord = o; victim = (int)i; victim_w = w; }
             }
         }
         if (victim < 0) return -1;   /* all looping/claimed, nothing stealable */
         unsigned vi = (unsigned)victim;
-        uint16_t gen = (uint16_t)((claim_gen(victim_w) + 1u) & 0x3FFFu);
-        if (gen == 0) gen = 1;
-        uint64_t ord = atomic_fetch_add_explicit(&seq->sfx_claim_next, 1u,
-                                                 memory_order_relaxed);
-        uint64_t nw = claim_pack(ST_CLAIMED, gen, ord);
+        uint32_t gen = claim_gen(victim_w) + 1u;
+        uint64_t ord = seq->sfx_claim_next++;
+        unsigned nw = claim_pack(ST_CLAIMED, gen);
         if (atomic_compare_exchange_strong_explicit(&seq->sfx_claim[vi], &victim_w, nw,
-                memory_order_acq_rel, memory_order_acquire))
+                memory_order_acq_rel, memory_order_acquire)) {
+            seq->sfx_claim_ordinal[vi] = ord;
             return handle_encode(vi, gen);
+        }
         /* lost race, retry */
     }
     return -1;
@@ -281,10 +313,10 @@ static int sfx_try_claim(chipseq *seq) {
 
 /* Render thread: publish a stopped slot back to FREE (no-op if stolen). */
 static void sfx_release(chipseq *seq, unsigned slot) {
-    uint64_t w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
+    unsigned w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
     unsigned st = claim_state(w);
     if (st == ST_PLAYING || st == ST_LOOPING) {
-        uint64_t nw = claim_pack(ST_FREE, claim_gen(w), 0);
+        unsigned nw = claim_pack(ST_FREE, claim_gen(w));
         (void)atomic_compare_exchange_strong_explicit(&seq->sfx_claim[slot], &w, nw,
                 memory_order_acq_rel, memory_order_acquire);
     }
@@ -295,7 +327,7 @@ static void sfx_release(chipseq *seq, unsigned slot) {
 /* ======================================================================== */
 
 static bool validate_seq(const chipseq_seq *s, const char *kind, uint16_t inst_i,
-                         char *err, size_t err_len) {
+                         int value_min, int value_max, char *err, size_t err_len) {
     if (!s) return true;
     if (s->values == NULL) {
         set_err(err, err_len, "instrument %u: %s values NULL", inst_i, kind);
@@ -315,6 +347,17 @@ static bool validate_seq(const chipseq_seq *s, const char *kind, uint16_t inst_i
         set_err(err, err_len, "instrument %u: %s release %d out of range",
                 inst_i, kind, s->release);
         return false;
+    }
+    if (value_min <= value_max) {
+        for (uint16_t i = 0; i < s->length; i++) {
+            int value = s->values[i];
+            if (value < value_min || value > value_max) {
+                set_err(err, err_len,
+                        "instrument %u: %s value[%u]=%d out of %d..%d",
+                        inst_i, kind, i, value, value_min, value_max);
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -347,6 +390,11 @@ bool chipseq_song_validate(const chipseq_song *song, char *err, size_t err_len) 
     }
     if (song->pattern_count < 1 || song->patterns == NULL) {
         set_err(err, err_len, "song '%s': pattern_count must be >= 1", nm);
+        return false;
+    }
+    if (song->instrument_count > 0 && song->instruments == NULL) {
+        set_err(err, err_len, "song '%s': instrument_count is %u but instruments is NULL",
+                nm, song->instrument_count);
         return false;
     }
     if (song->loop_order != CHIPSEQ_NO_LOOP && song->loop_order >= song->order_length) {
@@ -390,6 +438,12 @@ bool chipseq_song_validate(const chipseq_song *song, char *err, size_t err_len) 
                             nm, p, r, c, cell->fx);
                     return false;
                 }
+                if (cell->vol != CHIPSEQ_VOL_NONE && cell->vol > 64) {
+                    set_err(err, err_len,
+                            "song '%s': pattern %u row %u chan %u volume %u > 64",
+                            nm, p, r, c, cell->vol);
+                    return false;
+                }
             }
         }
     }
@@ -399,13 +453,40 @@ bool chipseq_song_validate(const chipseq_song *song, char *err, size_t err_len) 
             set_err(err, err_len, "song '%s': instrument %u wave %u invalid", nm, i, in->wave);
             return false;
         }
-        if (!validate_seq(in->vol_seq, "vol_seq", i, err, err_len)) return false;
-        if (!validate_seq(in->arp_seq, "arp_seq", i, err, err_len)) return false;
-        if (!validate_seq(in->pitch_seq, "pitch_seq", i, err, err_len)) return false;
-        if (!validate_seq(in->duty_seq, "duty_seq", i, err, err_len)) return false;
+        if ((in->wave == CHIPSEQ_WAVE_PULSE || in->wave == CHIPSEQ_WAVE_SAW) &&
+            in->duty > 63u) {
+            set_err(err, err_len, "song '%s': instrument %u duty %u > 63",
+                    nm, i, in->duty);
+            return false;
+        }
+        if (in->wave == CHIPSEQ_WAVE_NOISE && in->noise_mode > CHIPSEQ_NOISE_SHORT) {
+            set_err(err, err_len, "song '%s': instrument %u noise_mode %u invalid",
+                    nm, i, in->noise_mode);
+            return false;
+        }
+        if (in->wave == CHIPSEQ_WAVE_TRIANGLE && in->tri_steps > 0u && in->tri_steps < 4u) {
+            set_err(err, err_len,
+                    "song '%s': instrument %u tri_steps %u must be 0 or >= 4",
+                    nm, i, in->tri_steps);
+            return false;
+        }
+        if (!validate_seq(in->vol_seq, "vol_seq", i, 0, 64, err, err_len)) return false;
+        if (!validate_seq(in->arp_seq, "arp_seq", i, 1, 0, err, err_len)) return false;
+        if (!validate_seq(in->pitch_seq, "pitch_seq", i, 1, 0, err, err_len)) return false;
+        if (!validate_seq(in->duty_seq, "duty_seq", i, 1, 63, err, err_len)) return false;
         if (in->wave == CHIPSEQ_WAVE_WAVETABLE && in->wavetable == NULL) {
             set_err(err, err_len, "song '%s': instrument %u wavetable NULL", nm, i);
             return false;
+        }
+        if (in->wave == CHIPSEQ_WAVE_WAVETABLE) {
+            for (unsigned k = 0; k < CHIPSEQ_WAVETABLE_LEN; k++) {
+                if (in->wavetable[k] > 15u) {
+                    set_err(err, err_len,
+                            "song '%s': instrument %u wavetable[%u]=%u > 15",
+                            nm, i, k, in->wavetable[k]);
+                    return false;
+                }
+            }
         }
         if (in->wave == CHIPSEQ_WAVE_PCM) {
             const chipseq_pcm *pc = in->pcm;
@@ -498,8 +579,8 @@ static bool transport_step_tick(const chipseq_song *song, chipseq_track *t, uint
 
 uint64_t chipseq_song_frames(const chipseq_song *song, uint32_t sr) {
     if (!chipseq_song_validate(song, NULL, 0)) return 0;
+    if (sr < 8000u || sr > 192000u) return 0;
     if (song->loop_order != CHIPSEQ_NO_LOOP) return UINT64_MAX;
-    if (sr == 0) return 0;
 
     /* Frame count is oversample-independent, so simulate at the output rate. */
     chipseq_track t;
@@ -512,28 +593,67 @@ uint64_t chipseq_song_frames(const chipseq_song *song, uint32_t sr) {
     t.active = 1; t.looping = 0;
     apply_speed_tempo(song, &t, sr);
 
-    uint64_t sum = 0;   /* Q32 output samples */
-    for (uint64_t guard = 0; guard < 100000000ULL; guard++) {
-        sum += t.samples_per_tick;
+    /* Floyd cycle detection covers effect-driven loops (for example an
+     * FX_ORDER_JUMP back to the same row) even when loop_order says NO_LOOP. */
+    chipseq_track slow = t, fast = t;
+    bool slow_live = true, fast_live = true;
+
+    /* Accumulate whole and fractional frames separately. A single Q32 uint64_t
+     * would overflow after roughly 2^32 output frames even though the public
+     * return type can represent much longer finite songs. */
+    uint64_t whole_frames = 0;
+    uint32_t frac_frames = 0;
+
+    for (;;) {
+        uint64_t add_whole = t.samples_per_tick >> 32;
+        uint64_t frac_sum = (uint64_t)frac_frames
+                          + (uint32_t)t.samples_per_tick;
+        uint64_t carry = frac_sum >> 32;
+        if (whole_frames > UINT64_MAX - add_whole ||
+            whole_frames + add_whole > UINT64_MAX - carry)
+            return UINT64_MAX;
+        whole_frames += add_whole + carry;
+        frac_frames = (uint32_t)frac_sum;
+
         if (!transport_step_tick(song, &t, sr)) break;
+
+        if (slow_live) slow_live = transport_step_tick(song, &slow, sr);
+        if (fast_live) {
+            fast_live = transport_step_tick(song, &fast, sr);
+            if (fast_live) fast_live = transport_step_tick(song, &fast, sr);
+        }
+        if (slow_live && fast_live &&
+            slow.order_pos == fast.order_pos && slow.row == fast.row &&
+            slow.tick == fast.tick && slow.ticks_per_row == fast.ticks_per_row &&
+            slow.bpm_q8 == fast.bpm_q8 &&
+            slow.samples_per_tick == fast.samples_per_tick)
+            return UINT64_MAX;
     }
-    uint64_t frames = (sum + 0xFFFFFFFFULL) >> 32;   /* ceil */
-    return frames;
+
+    if (frac_frames != 0) {
+        if (whole_frames == UINT64_MAX) return UINT64_MAX;
+        whole_frames++;
+    }
+    return whole_frames;
 }
 
 /* ======================================================================== */
 /* voice trigger + per-tick engine (render side)                             */
 /* ======================================================================== */
 
-static void voice_note_off(chipseq_voice *v) {
+static unsigned voice_note_off(chipseq_voice *v) {
     const chipseq_instrument *in = v->inst;
-    if (!in) return;
+    if (!in) return 0;
     v->released = 1;
+    unsigned release_mask = 0;
     const chipseq_seq *seqs[4] = { in->vol_seq, in->arp_seq, in->pitch_seq, in->duty_seq };
     for (int i = 0; i < 4; i++) {
-        if (seqs[i] && seqs[i]->release != CHIPSEQ_SEQ_NO_RELEASE)
+        if (seqs[i] && seqs[i]->release != CHIPSEQ_SEQ_NO_RELEASE) {
             v->seq_pos[i] = (uint16_t)seqs[i]->release;
+            release_mask |= 1u << (unsigned)i;
+        }
     }
+    return release_mask;
 }
 
 static void voice_trigger(const chipseq_song *song, chipseq_voice *v,
@@ -547,6 +667,7 @@ static void voice_trigger(const chipseq_song *song, chipseq_voice *v,
     v->pcm_pos = 0;
     v->lfsr = K_LFSR_SEED;
     v->seq_pos[0] = v->seq_pos[1] = v->seq_pos[2] = v->seq_pos[3] = 0;
+    v->note_ticks = 0;
     v->cur_pitch = ((int32_t)cell->note + in->transpose) * 16 + in->finetune;
     v->released = 0;
     v->active = 1;
@@ -586,43 +707,55 @@ static void refresh_voice(chipseq *seq, chipseq_track *t, uint8_t ch, int32_t *v
         uint32_t speed = (uint32_t)(cell->fxp >> 4);
         int32_t depth = cell->fxp & 15;
         uint32_t idx = (abs_tick * speed) & 63u;
-        vol += ((int32_t)k_lfo[idx] * depth) >> 5;
+        vol += (int32_t)floor_shift_i64((int64_t)k_lfo[idx] * depth, 5);
     }
     vol = clampi(vol, 0, 64);
     uint32_t tg = track_gain_q8(seq, t);
     vgain[vi] = (int32_t)((uint32_t)vol * tg);   /* 0..64*256 */
 
     /* --- effective pitch (1/16-semitone) --- */
-    int32_t p = v->cur_pitch;
-    p += track_transpose(seq, t) * 16;
+    /* cur_pitch deliberately saturates at the int32 limits under repeated
+     * portamento. Accumulate transient modulation in int64 so an arp, SFX
+     * transpose, or pitch sequence cannot overflow before the audible clamp. */
+    int64_t p = v->cur_pitch;
+    p += (int64_t)track_transpose(seq, t) * 16;
     if (in->arp_seq)
-        p += (int32_t)in->arp_seq->values[v->seq_pos[SEQ_ARP]] * 16;
+        p += (int64_t)in->arp_seq->values[v->seq_pos[SEQ_ARP]] * 16;
     if (cell->fx == CHIPSEQ_FX_ARPEGGIO) {
         unsigned a = (unsigned)t->tick % 3u;
         int32_t off = (a == 0) ? 0 : (a == 1) ? (cell->fxp >> 4) : (cell->fxp & 15);
         p += off * 16;
     }
     if (in->pitch_seq)
-        p += (int32_t)in->pitch_seq->values[v->seq_pos[SEQ_PITCH]];
+        p += in->pitch_seq->values[v->seq_pos[SEQ_PITCH]];
     if (cell->fx == CHIPSEQ_FX_VIBRATO) {
         uint32_t speed = (uint32_t)(cell->fxp >> 4);
         int32_t depth = cell->fxp & 15;
         uint32_t idx = (abs_tick * speed) & 63u;
         p += (int32_t)k_lfo[idx] * depth;
     }
-    if (in->vib_speed && in->vib_depth) {   /* auto-vibrato (vib_delay not tracked) */
-        uint32_t idx = (abs_tick * (uint32_t)in->vib_speed) & 63u;
-        p += ((int32_t)k_lfo[idx] * (int32_t)in->vib_depth) >> 2;
+    if (in->vib_speed && in->vib_depth && v->note_ticks >= in->vib_delay) {
+        uint32_t age = v->note_ticks - in->vib_delay;
+        uint32_t idx = (age * (uint32_t)in->vib_speed) & 63u;
+        p += (int32_t)floor_shift_i64(
+                (int64_t)k_lfo[idx] * (int32_t)in->vib_depth, 2);
     }
 
     /* --- duty from duty_seq --- */
     if (in->duty_seq)
         v->duty = (uint8_t)clampi(in->duty_seq->values[v->seq_pos[SEQ_DUTY]], 1, 63);
 
-    if (in->wave == CHIPSEQ_WAVE_PCM && in->pcm)
-        v->phase_inc = pcm_step(seq, p, in->pcm->root_note);
+    int32_t audible_pitch;
+    if (p < 0)
+        audible_pitch = 0;
+    else if (p > 127 * 16)
+        audible_pitch = 127 * 16;
     else
-        v->phase_inc = inc_from_pitch(seq, p);
+        audible_pitch = (int32_t)p;
+    if (in->wave == CHIPSEQ_WAVE_PCM && in->pcm)
+        v->phase_inc = pcm_step(seq, audible_pitch, in->pcm->root_note);
+    else
+        v->phase_inc = inc_from_pitch(seq, audible_pitch);
 }
 
 static void refresh_track(chipseq *seq, chipseq_track *t, int32_t *vgain) {
@@ -635,6 +768,20 @@ static void refresh_all(chipseq *seq, int32_t *vgain) {
     for (unsigned i = 0; i < CHIPSEQ_SFX_SLOTS; i++) refresh_track(seq, &seq->sfx[i], vgain);
 }
 
+/* Stop every oscillator owned by a track and invalidate its cached gain. This
+ * must happen at the exact sample where the track ends: vgain lives for a whole
+ * render call, so merely clearing t->active would otherwise leave the final
+ * note audible until the caller's next block boundary. */
+static void silence_track_voices(chipseq *seq, const chipseq_track *t,
+                                 int32_t *vgain) {
+    for (uint8_t c = 0; c < t->channels; c++) {
+        unsigned vi = (unsigned)t->first_voice + c;
+        seq->voices[vi].active = 0;
+        seq->voices[vi].inst = NULL;
+        vgain[vi] = 0;
+    }
+}
+
 /* Process one sequencer tick for a track (note triggers, sequence advance,
  * running effects), then refresh the track's voices. */
 static void render_process_tick(chipseq *seq, chipseq_track *t, int32_t *vgain) {
@@ -645,7 +792,11 @@ static void render_process_tick(chipseq *seq, chipseq_track *t, int32_t *vgain) 
 
     if (is_music && t->fade_ticks > 0) {   /* fade-out clock */
         if (t->fade_left > 0) t->fade_left = (uint16_t)(t->fade_left - 1);
-        if (t->fade_left == 0) { t->active = 0; refresh_track(seq, t, vgain); return; }
+        if (t->fade_left == 0) {
+            t->active = 0;
+            silence_track_voices(seq, t, vgain);
+            return;
+        }
     }
 
     for (uint8_t c = 0; c < t->channels; c++) {
@@ -653,12 +804,13 @@ static void render_process_tick(chipseq *seq, chipseq_track *t, int32_t *vgain) 
         chipseq_voice *v = &seq->voices[vi];
         const chipseq_cell *cell = &pat->cells[(size_t)t->row * t->channels + c];
         bool trig = false;
+        unsigned release_mask = 0;
 
         if (tick == 0) {
             if (cell->note == CHIPSEQ_NOTE_NONE) {
                 if (cell->vol != CHIPSEQ_VOL_NONE) v->vol = cell->vol;
             } else if (cell->note == CHIPSEQ_NOTE_OFF) {
-                voice_note_off(v);
+                release_mask = voice_note_off(v);
             } else if (cell->note == CHIPSEQ_NOTE_CUT) {
                 v->active = 0;
             } else {   /* real note 0..127 */
@@ -685,21 +837,31 @@ static void render_process_tick(chipseq *seq, chipseq_track *t, int32_t *vgain) 
             (tick % cell->fxp) == 0 && v->inst) {
             v->phase = 0; v->pcm_pos = 0; v->lfsr = K_LFSR_SEED;
             v->seq_pos[0] = v->seq_pos[1] = v->seq_pos[2] = v->seq_pos[3] = 0;
+            v->note_ticks = 0;
             v->released = 0; v->active = 1; trig = true;
         }
 
         if (v->active && !trig && v->inst) {
             const chipseq_instrument *in = v->inst;
-            advance_sequence(in->vol_seq, &v->seq_pos[SEQ_VOL]);
-            advance_sequence(in->arp_seq, &v->seq_pos[SEQ_ARP]);
-            advance_sequence(in->pitch_seq, &v->seq_pos[SEQ_PITCH]);
-            advance_sequence(in->duty_seq, &v->seq_pos[SEQ_DUTY]);
+            if ((release_mask & (1u << SEQ_VOL)) == 0)
+                advance_sequence(in->vol_seq, &v->seq_pos[SEQ_VOL]);
+            if ((release_mask & (1u << SEQ_ARP)) == 0)
+                advance_sequence(in->arp_seq, &v->seq_pos[SEQ_ARP]);
+            if ((release_mask & (1u << SEQ_PITCH)) == 0)
+                advance_sequence(in->pitch_seq, &v->seq_pos[SEQ_PITCH]);
+            if ((release_mask & (1u << SEQ_DUTY)) == 0)
+                advance_sequence(in->duty_seq, &v->seq_pos[SEQ_DUTY]);
+            v->note_ticks++;
         }
 
         if (tick > 0 && v->active) {
             switch (cell->fx) {
-            case CHIPSEQ_FX_PORTA_UP:   v->cur_pitch += cell->fxp; break;
-            case CHIPSEQ_FX_PORTA_DOWN: v->cur_pitch -= cell->fxp; break;
+            case CHIPSEQ_FX_PORTA_UP:
+                v->cur_pitch = saturating_add_i32(v->cur_pitch, (int32_t)cell->fxp);
+                break;
+            case CHIPSEQ_FX_PORTA_DOWN:
+                v->cur_pitch = saturating_add_i32(v->cur_pitch, -(int32_t)cell->fxp);
+                break;
             case CHIPSEQ_FX_TONE_PORTA: {
                 const chipseq_instrument *in = v->inst;
                 int32_t target = ((int32_t)v->note + (in ? in->transpose : 0)) * 16
@@ -720,7 +882,7 @@ static void render_process_tick(chipseq *seq, chipseq_track *t, int32_t *vgain) 
             }
         }
 
-        if (cell->fx == CHIPSEQ_FX_NOTE_CUT && tick == cell->fxp && tick > 0)
+        if (cell->fx == CHIPSEQ_FX_NOTE_CUT && tick == cell->fxp)
             v->vol = 0;
     }
 
@@ -731,7 +893,13 @@ static void advance_to_next_tick(chipseq *seq, chipseq_track *t, unsigned slot,
                                  int32_t *vgain) {
     if (!transport_step_tick(t->song, t, seq->out_rate)) {
         t->active = 0;
-        if (!track_is_music(seq, t)) sfx_release(seq, slot);
+        silence_track_voices(seq, t, vgain);
+        if (!track_is_music(seq, t)) {
+            sfx_release(seq, slot);
+            /* Ducking is derived from live SFX tracks, so restore music gain at
+             * this same sample rather than at the next render block. */
+            refresh_track(seq, &seq->music, vgain);
+        }
         return;
     }
     render_process_tick(seq, t, vgain);
@@ -787,7 +955,7 @@ static int32_t synth_voice(chipseq_voice *v) {
             up = q * 32767u / (steps - 1u);
         }
         w = (int32_t)up * 2 - 32767;
-        v->phase += (v->phase_inc >> 1);   /* triangle: half-rate advance */
+        v->phase += v->phase_inc;
         break;
     }
     case CHIPSEQ_WAVE_SAW: {
@@ -818,23 +986,27 @@ static int32_t synth_voice(chipseq_voice *v) {
     }
     case CHIPSEQ_WAVE_PCM: {
         const chipseq_pcm *p = in->pcm;
-        uint32_t idx = (uint32_t)(v->pcm_pos >> 16);
-        if (idx >= p->frame_count) { v->active = 0; return 0; }
+        uint64_t idx64 = v->pcm_pos >> 16;
+        if (idx64 >= p->frame_count) { v->active = 0; return 0; }
+        uint32_t idx = (uint32_t)idx64;
         bool loop = (p->loop_start < p->loop_end);
         uint32_t nidx = idx + 1u;
-        if (nidx >= p->frame_count) nidx = loop ? p->loop_start : idx;
+        if (loop && nidx >= p->loop_end)
+            nidx = p->loop_start;
+        else if (nidx >= p->frame_count)
+            nidx = idx;
         int32_t s0 = p->frames[idx], s1 = p->frames[nidx];
         uint32_t fr = (uint32_t)(v->pcm_pos & 0xFFFFu);
-        w = s0 + (int32_t)(((int64_t)(s1 - s0) * fr) >> 16);
+        w = s0 + (int32_t)floor_shift_i64((int64_t)(s1 - s0) * fr, 16);
         v->pcm_pos += v->phase_inc;
-        uint32_t nq = (uint32_t)(v->pcm_pos >> 16);
         if (loop) {
-            int g = 0;
-            while (nq >= p->loop_end && g++ < 64) {
-                v->pcm_pos -= (uint64_t)(p->loop_end - p->loop_start) << 16;
-                nq = (uint32_t)(v->pcm_pos >> 16);
-            }
-        } else if (nq >= p->frame_count) {
+            uint64_t loop_start_q16 = (uint64_t)p->loop_start << 16;
+            uint64_t loop_end_q16 = (uint64_t)p->loop_end << 16;
+            uint64_t loop_len_q16 = loop_end_q16 - loop_start_q16;
+            if (v->pcm_pos >= loop_end_q16)
+                v->pcm_pos = loop_start_q16
+                           + (v->pcm_pos - loop_start_q16) % loop_len_q16;
+        } else if ((v->pcm_pos >> 16) >= p->frame_count) {
             v->active = 0;
         }
         break;
@@ -846,11 +1018,23 @@ static int32_t synth_voice(chipseq_voice *v) {
 
 /* Mix one oversampled sample. Returns post-master int32 L (and R for stereo),
  * unclamped (clamped after decimation). */
+static int64_t nes_mix_value(int32_t pulse, int32_t tri, int32_t noise) {
+    pulse = clampi(pulse, 0, 30);
+    tri = clampi(tri, 0, 15);
+    noise = clampi(noise, 0, 15);
+    int32_t ti = 3 * tri + 2 * noise;
+    if (ti > 202) ti = 202;
+    return ((int64_t)(k_nes_pulse[pulse] + k_nes_tnd[ti])) << 8;
+}
+
 static void mix_oversample(chipseq *seq, const int32_t *vgain, bool stereo,
                            int32_t *outL, int32_t *outR) {
     bool nes = (seq->mix_mode == CHIPSEQ_MIX_NES);
     int64_t lin = 0, linL = 0, linR = 0;
     int32_t pulse_sum = 0, tri_sum = 0, noise_sum = 0;
+    int32_t pulse_l = 0, pulse_r = 0;
+    int32_t tri_l = 0, tri_r = 0;
+    int32_t noise_l = 0, noise_r = 0;
 
     for (unsigned vi = 0; vi < CHIPSEQ_VOICES_MAX; vi++) {
         chipseq_voice *v = &seq->voices[vi];
@@ -859,28 +1043,44 @@ static void mix_oversample(chipseq *seq, const int32_t *vgain, bool stereo,
         int32_t g = vgain[vi];
         if (nes) {
             uint8_t wave = v->inst->wave;
+            int32_t vl = clampi(g >> 10, 0, 15);
+            int32_t left = vl;
+            int32_t right = vl;
+            if (stereo) {
+                int32_t pan = v->pan;
+                left = (vl * (255 - pan) + 127) / 255;
+                right = (vl * pan + 127) / 255;
+            }
             if (wave == CHIPSEQ_WAVE_PULSE) {
-                int32_t vl = clampi(g >> 10, 0, 15);
-                pulse_sum += (w > 0) ? vl : 0;
+                if (w > 0) {
+                    if (stereo) { pulse_l += left; pulse_r += right; }
+                    else pulse_sum += vl;
+                }
                 continue;
             }
             if (wave == CHIPSEQ_WAVE_TRIANGLE) {
-                int32_t vl = clampi(g >> 10, 0, 15);
                 uint32_t up = (uint32_t)((w + 32767) >> 1);
-                tri_sum += (int32_t)((up * (uint32_t)vl) >> 15);
+                if (stereo) {
+                    tri_l += (int32_t)((up * (uint32_t)left) >> 15);
+                    tri_r += (int32_t)((up * (uint32_t)right) >> 15);
+                } else {
+                    tri_sum += (int32_t)((up * (uint32_t)vl) >> 15);
+                }
                 continue;
             }
             if (wave == CHIPSEQ_WAVE_NOISE) {
-                int32_t vl = clampi(g >> 10, 0, 15);
-                noise_sum += (w > 0) ? vl : 0;
+                if (w > 0) {
+                    if (stereo) { noise_l += left; noise_r += right; }
+                    else noise_sum += vl;
+                }
                 continue;
             }
         }
-        int64_t c = ((int64_t)w * g) >> 8;
-        if (stereo && !nes) {
+        int64_t c = floor_shift_i64((int64_t)w * g, 8);
+        if (stereo) {
             int32_t pan = v->pan;
-            linL += (c * (255 - pan)) >> 8;
-            linR += (c * pan) >> 8;
+            linL += floor_shift_i64(c * (255 - pan), 8);
+            linR += floor_shift_i64(c * pan, 8);
         } else {
             lin += c;
         }
@@ -888,20 +1088,20 @@ static void mix_oversample(chipseq *seq, const int32_t *vgain, bool stereo,
 
     int64_t accL, accR;
     if (nes) {
-        pulse_sum = clampi(pulse_sum, 0, 30);
-        tri_sum = clampi(tri_sum, 0, 15);
-        noise_sum = clampi(noise_sum, 0, 15);
-        int32_t ti = 3 * tri_sum + 2 * noise_sum;
-        if (ti > 202) ti = 202;
-        int64_t nesv = ((int64_t)(k_nes_pulse[pulse_sum] + k_nes_tnd[ti])) << 8;
-        accL = accR = nesv + lin;
+        if (stereo) {
+            accL = nes_mix_value(pulse_l, tri_l, noise_l) + linL;
+            accR = nes_mix_value(pulse_r, tri_r, noise_r) + linR;
+        } else {
+            accL = accR = nes_mix_value(pulse_sum, tri_sum, noise_sum) + lin;
+        }
     } else if (stereo) {
         accL = linL; accR = linR;
     } else {
         accL = accR = lin;
     }
-    *outL = (int32_t)((accL * (int64_t)seq->volume_q8) >> 16);
-    if (outR) *outR = (int32_t)((accR * (int64_t)seq->volume_q8) >> 16);
+    *outL = (int32_t)floor_shift_i64(accL * (int64_t)seq->volume_q8, 16);
+    if (outR)
+        *outR = (int32_t)floor_shift_i64(accR * (int64_t)seq->volume_q8, 16);
 }
 
 /* ======================================================================== */
@@ -918,7 +1118,7 @@ static int32_t hb15(const int32_t z[15]) {
               + (int64_t)HB_K3 * ((int64_t)z[4] + z[10])
               + (int64_t)HB_K5 * ((int64_t)z[2] + z[12])
               + (int64_t)HB_K7 * ((int64_t)z[0] + z[14]);
-    return (int32_t)(a >> 15);
+    return (int32_t)floor_shift_i64(a, 15);
 }
 
 /* ======================================================================== */
@@ -926,10 +1126,23 @@ static int32_t hb15(const int32_t z[15]) {
 /* ======================================================================== */
 
 static uint32_t float_to_q8(float f) {
-    if (f < 0.0f) f = 0.0f;
-    if (f > 1.0f) f = 1.0f;
+    /* The negated comparison also catches NaN without requiring libm. */
+    if (!(f > 0.0f)) return 0;
+    if (f >= 1.0f) return 256u;
     uint32_t q = (uint32_t)(f * 256.0f + 0.5f);
     return q > 256u ? 256u : q;
+}
+
+static bool gain_is_valid(float f) {
+    return f == f && f >= 0.0f && f <= 1.0f;
+}
+
+static bool options_are_valid(const chipseq_options *options) {
+    if (options->sample_rate < 8000u || options->sample_rate > 192000u) return false;
+    if (options->oversample != 1u && options->oversample != 2u && options->oversample != 4u)
+        return false;
+    if (options->mix_mode > CHIPSEQ_MIX_NES) return false;
+    return gain_is_valid(options->volume) && gain_is_valid(options->sfx_duck);
 }
 
 static void reset_track_voices(chipseq *seq, uint8_t first, uint8_t channels) {
@@ -963,6 +1176,7 @@ static void apply_cmd(chipseq *seq, const chipseq_cmd *cmd, int32_t *vgain) {
     switch (cmd->op) {
     case OP_MUSIC_PLAY: {
         chipseq_track *t = &seq->music;
+        silence_track_voices(seq, t, vgain);
         t->fade_ticks = 0; t->fade_left = 0;
         t->generation = 256;   /* music volume, 1/256 */
         start_track(seq, t, cmd->song, 0, cmd->loop != 0);
@@ -972,28 +1186,30 @@ static void apply_cmd(chipseq *seq, const chipseq_cmd *cmd, int32_t *vgain) {
     case OP_MUSIC_STOP:
         if (cmd->ia <= 0) {
             seq->music.active = 0;
+            silence_track_voices(seq, &seq->music, vgain);
         } else {
             seq->music.fade_ticks = (uint16_t)cmd->ia;
             seq->music.fade_left = (uint16_t)cmd->ia;
         }
         break;
     case OP_MUSIC_VOL:
-        seq->music.generation = (uint16_t)float_to_q8(cmd->fa);
+        seq->music.generation = float_to_q8(cmd->fa);
         break;
     case OP_MUSIC_PAUSE:
         seq->music.paused = cmd->loop ? 1u : 0u;
         break;
     case OP_SFX_PLAY: {
         unsigned slot = cmd->slot;
-        uint16_t gen = cmd->generation;
-        uint64_t w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
+        uint32_t gen = cmd->generation;
+        unsigned w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
         if (claim_state(w) != ST_CLAIMED || claim_gen(w) != gen) break;
         unsigned newstate = (cmd->loop != 0) ? ST_LOOPING : ST_PLAYING;
-        uint64_t nw = claim_pack(newstate, gen, claim_ord(w));
+        unsigned nw = claim_pack(newstate, gen);
         if (!atomic_compare_exchange_strong_explicit(&seq->sfx_claim[slot], &w, nw,
                 memory_order_acq_rel, memory_order_acquire))
             break;
         chipseq_track *t = &seq->sfx[slot];
+        silence_track_voices(seq, t, vgain);
         uint8_t fv = (uint8_t)(CHIPSEQ_CHANNELS_MAX + slot * CHIPSEQ_SFX_CHANNELS_MAX);
         t->generation = gen;
         start_track(seq, t, cmd->song, fv, cmd->loop != 0);
@@ -1016,7 +1232,9 @@ static void apply_cmd(chipseq *seq, const chipseq_cmd *cmd, int32_t *vgain) {
         chipseq_track *t = &seq->sfx[slot];
         if (t->active && t->generation == cmd->generation) {
             t->active = 0;
+            silence_track_voices(seq, t, vgain);
             sfx_release(seq, slot);
+            refresh_track(seq, &seq->music, vgain);
         }
         break;
     }
@@ -1024,9 +1242,11 @@ static void apply_cmd(chipseq *seq, const chipseq_cmd *cmd, int32_t *vgain) {
         for (unsigned i = 0; i < CHIPSEQ_SFX_SLOTS; i++) {
             if (seq->sfx[i].active) {
                 seq->sfx[i].active = 0;
+                silence_track_voices(seq, &seq->sfx[i], vgain);
                 sfx_release(seq, i);
             }
         }
+        refresh_track(seq, &seq->music, vgain);
         break;
     default: break;
     }
@@ -1047,21 +1267,17 @@ static void queue_drain(chipseq *seq, int32_t *vgain) {
 /* ======================================================================== */
 
 static void write_snapshot(chipseq *seq) {
-    uint32_t s = atomic_load_explicit(&seq->snap_seq, memory_order_relaxed);
-    /* Publish the odd marker, then a release fence, so the StoreStore barrier
-     * keeps the odd-store ordered BEFORE the plain snapshot writes below. A bare
-     * release store would only order prior ops before itself, letting the data
-     * writes float above the odd marker on weakly-ordered CPUs (ARM64/POWER) and
-     * letting a reader observe half-updated data while snap_seq is still even. */
-    atomic_store_explicit(&seq->snap_seq, s + 1u, memory_order_relaxed);   /* odd */
-    atomic_thread_fence(memory_order_release);
-    seq->snap.order_pos = seq->music.order_pos;
-    seq->snap.row = seq->music.row;
-    seq->snap.tick = seq->music.tick;
-    seq->snap.music_active = seq->music.active;
-    /* The release on the even store orders the data writes before it, so a
-     * reader that sees this even value has seen all the data writes. */
-    atomic_store_explicit(&seq->snap_seq, s + 2u, memory_order_release);   /* even */
+    unsigned position = (unsigned)seq->music.order_pos
+                      | ((unsigned)seq->music.row << 16);
+    unsigned state = (unsigned)seq->music.tick
+                   | ((unsigned)(seq->music.active != 0) << 8);
+    /* Keep every snapshot operation in one sequentially-consistent order. It
+     * makes the seqlock proof apply across the three distinct atomic objects:
+     * equal even versions cannot bracket payload from an intervening publish. */
+    (void)atomic_fetch_add_explicit(&seq->snap_seq, 1u, memory_order_seq_cst);
+    atomic_store_explicit(&seq->snap_position, position, memory_order_seq_cst);
+    atomic_store_explicit(&seq->snap_state, state, memory_order_seq_cst);
+    (void)atomic_fetch_add_explicit(&seq->snap_seq, 1u, memory_order_seq_cst);
 }
 
 /* ======================================================================== */
@@ -1109,7 +1325,8 @@ static void render_block(chipseq *seq, size_t frames, int16_t *o16, float *of32)
             outv = hb15(z1);
         }
         if (seq->lowpass) {
-            seq->lp_mono += (int32_t)(((int64_t)(outv - seq->lp_mono) * seq->lowpass) >> 16);
+            int64_t delta = (int64_t)outv - seq->lp_mono;
+            seq->lp_mono += (int32_t)floor_shift_i64(delta * seq->lowpass, 16);
             outv = seq->lp_mono;
         }
         int16_t sample = clamp16(outv);
@@ -1161,8 +1378,10 @@ static void render_block_stereo(chipseq *seq, size_t frames, int16_t *dst) {
             push15(z1r, o0r); push15(z1r, o1r); oR = hb15(z1r);
         }
         if (seq->lowpass) {
-            seq->lp_l += (int32_t)(((int64_t)(oL - seq->lp_l) * seq->lowpass) >> 16); oL = seq->lp_l;
-            seq->lp_r += (int32_t)(((int64_t)(oR - seq->lp_r) * seq->lowpass) >> 16); oR = seq->lp_r;
+            int64_t delta_l = (int64_t)oL - seq->lp_l;
+            int64_t delta_r = (int64_t)oR - seq->lp_r;
+            seq->lp_l += (int32_t)floor_shift_i64(delta_l * seq->lowpass, 16); oL = seq->lp_l;
+            seq->lp_r += (int32_t)floor_shift_i64(delta_r * seq->lowpass, 16); oR = seq->lp_r;
         }
         dst[2 * f]     = clamp16(oL);
         dst[2 * f + 1] = clamp16(oR);
@@ -1188,21 +1407,31 @@ bool chipseq_init(chipseq *seq, const chipseq_options *options) {
     if (!seq) return false;
     chipseq_options def;
     chipseq_options_init(&def);
-    const chipseq_options *o = options ? options : &def;
+    chipseq_options selected = options ? *options : def;
 
-    if (o->sample_rate < 8000u || o->sample_rate > 192000u) return false;
-    uint8_t ov = o->oversample;
-    if (ov != 1 && ov != 2 && ov != 4) return false;
-    if (o->mix_mode > CHIPSEQ_MIX_NES) return false;
-
+    /* Establish the documented safe, uninitialized state before validating.
+     * Reinitialization is only allowed once the render thread has stopped. */
     memset(seq, 0, sizeof *seq);
-    seq->sample_rate = o->sample_rate;
+    for (unsigned i = 0; i < CHIPSEQ_SFX_SLOTS; i++)
+        atomic_init(&seq->sfx_claim[i], claim_pack(ST_FREE, 0));
+    seq->sfx_claim_next = 1u;
+    atomic_init(&seq->queue_head, 0u);
+    atomic_init(&seq->queue_tail, 0u);
+    atomic_init(&seq->snap_seq, 0u);
+    atomic_init(&seq->snap_position, 0u);
+    atomic_init(&seq->snap_state, 0u);
+    atomic_init(&seq->enabled, 0u);
+
+    if (!options_are_valid(&selected)) return false;
+    uint8_t ov = selected.oversample;
+
+    seq->sample_rate = selected.sample_rate;
     seq->oversample = ov;
-    seq->out_rate = o->sample_rate * ov;
-    seq->mix_mode = o->mix_mode;
-    seq->volume_q8 = float_to_q8(o->volume);
-    seq->duck_q8 = float_to_q8(o->sfx_duck);
-    seq->lowpass = o->lowpass;
+    seq->out_rate = selected.sample_rate * ov;
+    seq->mix_mode = selected.mix_mode;
+    seq->volume_q8 = float_to_q8(selected.volume);
+    seq->duck_q8 = float_to_q8(selected.sfx_duck);
+    seq->lowpass = selected.lowpass;
 
     for (int n = 0; n < 128; n++) {
         int d = n - 69;
@@ -1217,14 +1446,7 @@ bool chipseq_init(chipseq *seq, const chipseq_options *options) {
         seq->note_inc[n] = (int32_t)inc;
     }
 
-    for (unsigned i = 0; i < CHIPSEQ_SFX_SLOTS; i++)
-        atomic_store_explicit(&seq->sfx_claim[i], claim_pack(ST_FREE, 0, 0),
-                              memory_order_relaxed);
-    atomic_store_explicit(&seq->sfx_claim_next, 1u, memory_order_relaxed);
-    atomic_store_explicit(&seq->queue_head, 0u, memory_order_relaxed);
-    atomic_store_explicit(&seq->queue_tail, 0u, memory_order_relaxed);
-    atomic_store_explicit(&seq->snap_seq, 0u, memory_order_relaxed);
-    atomic_store_explicit(&seq->enabled, true, memory_order_relaxed);
+    atomic_store_explicit(&seq->enabled, 1u, memory_order_relaxed);
     seq->offline = false;
     seq->initialized = true;
     return true;
@@ -1236,23 +1458,26 @@ void chipseq_shutdown(chipseq *seq) {
     seq->music.paused = 0;
     for (unsigned i = 0; i < CHIPSEQ_SFX_SLOTS; i++) {
         seq->sfx[i].active = 0;
-        atomic_store_explicit(&seq->sfx_claim[i], claim_pack(ST_FREE, 0, 0),
+        atomic_store_explicit(&seq->sfx_claim[i], claim_pack(ST_FREE, 0),
                               memory_order_relaxed);
     }
     atomic_store_explicit(&seq->queue_head, 0u, memory_order_relaxed);
     atomic_store_explicit(&seq->queue_tail, 0u, memory_order_relaxed);
-    atomic_store_explicit(&seq->enabled, false, memory_order_relaxed);
+    atomic_store_explicit(&seq->snap_position, 0u, memory_order_relaxed);
+    atomic_store_explicit(&seq->snap_state, 0u, memory_order_relaxed);
+    atomic_store_explicit(&seq->snap_seq, 0u, memory_order_release);
+    atomic_store_explicit(&seq->enabled, 0u, memory_order_relaxed);
     seq->initialized = false;
 }
 
 void chipseq_set_enabled(chipseq *seq, bool on) {
-    if (!seq) return;
-    atomic_store_explicit(&seq->enabled, on, memory_order_release);
+    if (!seq || !seq->initialized) return;
+    atomic_store_explicit(&seq->enabled, on ? 1u : 0u, memory_order_release);
 }
 
 bool chipseq_is_enabled(const chipseq *seq) {
-    if (!seq) return false;
-    return atomic_load_explicit(&seq->enabled, memory_order_acquire);
+    if (!seq || !seq->initialized) return false;
+    return atomic_load_explicit(&seq->enabled, memory_order_acquire) != 0u;
 }
 
 /* ======================================================================== */
@@ -1287,6 +1512,7 @@ bool chipseq_music_stop(chipseq *seq, uint16_t fade_ticks) {
 
 bool chipseq_music_set_volume(chipseq *seq, float volume) {
     if (!seq || !seq->initialized) return false;
+    if (!gain_is_valid(volume)) return false;
     if (!queue_space(seq)) return false;
     chipseq_cmd c;
     memset(&c, 0, sizeof c);
@@ -1307,18 +1533,20 @@ bool chipseq_music_set_paused(chipseq *seq, bool paused) {
 
 bool chipseq_music_position(const chipseq *seq, uint16_t *order_pos,
                             uint16_t *row, uint8_t *tick) {
-    if (!seq) return false;
-    for (int attempt = 0; attempt < 64; attempt++) {
-        uint32_t s1 = atomic_load_explicit(&seq->snap_seq, memory_order_acquire);
-        if (s1 & 1u) continue;
-        chipseq_snapshot snap = seq->snap;
-        atomic_thread_fence(memory_order_acquire);
-        uint32_t s2 = atomic_load_explicit(&seq->snap_seq, memory_order_acquire);
-        if (s1 != s2) continue;
-        if (!snap.music_active) return false;
-        if (order_pos) *order_pos = snap.order_pos;
-        if (row) *row = snap.row;
-        if (tick) *tick = snap.tick;
+    if (!seq || !seq->initialized) return false;
+    unsigned position, state;
+    for (unsigned attempt = 0; attempt < 64u; attempt++) {
+        unsigned before, after;
+        before = atomic_load_explicit(&seq->snap_seq, memory_order_seq_cst);
+        if ((before & 1u) != 0u) continue;
+        position = atomic_load_explicit(&seq->snap_position, memory_order_seq_cst);
+        state = atomic_load_explicit(&seq->snap_state, memory_order_seq_cst);
+        after = atomic_load_explicit(&seq->snap_seq, memory_order_seq_cst);
+        if (before != after || (after & 1u) != 0u) continue;
+        if (((state >> 8) & 1u) == 0u) return false;
+        if (order_pos) *order_pos = (uint16_t)(position & 0xFFFFu);
+        if (row) *row = (uint16_t)((position >> 16) & 0xFFFFu);
+        if (tick) *tick = (uint8_t)(state & 0xFFu);
         return true;
     }
     return false;
@@ -1328,10 +1556,10 @@ bool chipseq_music_position(const chipseq *seq, uint16_t *order_pos,
 /* public SFX                                                                */
 /* ======================================================================== */
 
-static void sfx_release_claimed(chipseq *seq, unsigned slot, uint16_t gen) {
-    uint64_t w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
+static void sfx_release_claimed(chipseq *seq, unsigned slot, uint32_t gen) {
+    unsigned w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
     if (claim_state(w) == ST_CLAIMED && claim_gen(w) == gen) {
-        uint64_t nw = claim_pack(ST_FREE, gen, 0);
+        unsigned nw = claim_pack(ST_FREE, gen);
         (void)atomic_compare_exchange_strong_explicit(&seq->sfx_claim[slot], &w, nw,
                 memory_order_acq_rel, memory_order_acquire);
     }
@@ -1341,6 +1569,7 @@ int chipseq_sfx_play(chipseq *seq, const chipseq_song *song, float vol,
                      int transpose, bool loop) {
     if (!seq || !seq->initialized) return -1;
     if (!atomic_load_explicit(&seq->enabled, memory_order_acquire)) return -1;
+    if (!gain_is_valid(vol)) return -1;
     if (!chipseq_song_validate(song, NULL, 0)) return -1;
     if (song->channels > CHIPSEQ_SFX_CHANNELS_MAX) return -1;
     if (!queue_space(seq)) return -1;
@@ -1348,7 +1577,7 @@ int chipseq_sfx_play(chipseq *seq, const chipseq_song *song, float vol,
     int handle = sfx_try_claim(seq);
     if (handle < 0) return -1;
     unsigned slot = (unsigned)(handle & 3);
-    uint16_t gen = (uint16_t)(handle >> 2);
+    uint32_t gen = (uint32_t)handle >> 2;
 
     chipseq_cmd c;
     memset(&c, 0, sizeof c);
@@ -1368,10 +1597,11 @@ int chipseq_sfx_play(chipseq *seq, const chipseq_song *song, float vol,
 
 bool chipseq_sfx_set(chipseq *seq, int handle, float vol, int transpose) {
     if (!seq || !seq->initialized || handle <= 0) return false;
+    if (!gain_is_valid(vol)) return false;
     unsigned slot = (unsigned)(handle & 3);
-    uint16_t gen = (uint16_t)(handle >> 2);
+    uint32_t gen = (uint32_t)handle >> 2;
     if (slot >= CHIPSEQ_SFX_SLOTS) return false;
-    uint64_t w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
+    unsigned w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
     if (claim_state(w) == ST_FREE || claim_gen(w) != gen) return false;
     if (!queue_space(seq)) return false;
     chipseq_cmd c;
@@ -1387,9 +1617,9 @@ bool chipseq_sfx_set(chipseq *seq, int handle, float vol, int transpose) {
 bool chipseq_sfx_stop(chipseq *seq, int handle) {
     if (!seq || !seq->initialized || handle <= 0) return false;
     unsigned slot = (unsigned)(handle & 3);
-    uint16_t gen = (uint16_t)(handle >> 2);
+    uint32_t gen = (uint32_t)handle >> 2;
     if (slot >= CHIPSEQ_SFX_SLOTS) return false;
-    uint64_t w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
+    unsigned w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
     if (claim_state(w) == ST_FREE || claim_gen(w) != gen) return false;
     if (!queue_space(seq)) return false;
     chipseq_cmd c;
@@ -1400,21 +1630,21 @@ bool chipseq_sfx_stop(chipseq *seq, int handle) {
     return queue_push(seq, &c);
 }
 
-void chipseq_sfx_stop_all(chipseq *seq) {
-    if (!seq || !seq->initialized) return;
-    if (!queue_space(seq)) return;
+bool chipseq_sfx_stop_all(chipseq *seq) {
+    if (!seq || !seq->initialized) return false;
+    if (!queue_space(seq)) return false;
     chipseq_cmd c;
     memset(&c, 0, sizeof c);
     c.op = OP_SFX_STOP_ALL;
-    (void)queue_push(seq, &c);
+    return queue_push(seq, &c);
 }
 
 bool chipseq_sfx_active(const chipseq *seq, int handle) {
-    if (!seq || handle <= 0) return false;
+    if (!seq || !seq->initialized || handle <= 0) return false;
     unsigned slot = (unsigned)(handle & 3);
-    uint16_t gen = (uint16_t)(handle >> 2);
+    uint32_t gen = (uint32_t)handle >> 2;
     if (slot >= CHIPSEQ_SFX_SLOTS) return false;
-    uint64_t w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
+    unsigned w = atomic_load_explicit(&seq->sfx_claim[slot], memory_order_acquire);
     return claim_state(w) != ST_FREE && claim_gen(w) == gen;
 }
 
@@ -1452,43 +1682,57 @@ void chipseq_flush_commands(chipseq *seq) {
 /* offline bounce                                                            */
 /* ======================================================================== */
 
+static bool resolve_render_length(const chipseq_song *song, uint32_t sample_rate,
+                                  uint64_t max_frames, uint64_t *out,
+                                  char *err, size_t err_len) {
+    uint64_t natural = chipseq_song_frames(song, sample_rate);
+    if (natural == 0) {
+        set_err(err, err_len, "cannot determine song length");
+        return false;
+    }
+    if (max_frames == 0) {
+        if (natural == UINT64_MAX) {
+            set_err(err, err_len, "infinite/looping song requires nonzero max_frames");
+            return false;
+        }
+        *out = natural;
+    } else {
+        *out = (natural == UINT64_MAX || max_frames < natural) ? max_frames : natural;
+    }
+    return true;
+}
+
 int16_t *chipseq_render_song(const chipseq_song *song, const chipseq_options *options,
                              uint64_t max_frames, size_t *out_frames,
                              char *err, size_t err_len) {
+    if (out_frames) *out_frames = 0;
     if (!chipseq_song_validate(song, err, err_len)) return NULL;
     chipseq_options def;
     chipseq_options_init(&def);
-    const chipseq_options *o = options ? options : &def;
+    chipseq_options selected = options ? *options : def;
+    if (!options_are_valid(&selected)) {
+        set_err(err, err_len, "invalid options");
+        return NULL;
+    }
 
     uint64_t n;
-    if (max_frames > 0) {
-        n = max_frames;
-    } else {
-        n = chipseq_song_frames(song, o->sample_rate);
-        if (n == UINT64_MAX) {
-            set_err(err, err_len, "infinite/looping song requires nonzero max_frames");
-            return NULL;
-        }
-    }
-    if (n == 0) n = 1;
+    if (!resolve_render_length(song, selected.sample_rate, max_frames, &n, err, err_len))
+        return NULL;
     if (n > (SIZE_MAX / sizeof(int16_t))) {
         set_err(err, err_len, "requested length too large");
         return NULL;
     }
 
-    int16_t *buf = (int16_t *)malloc((size_t)n * sizeof(int16_t));
-    if (!buf) { set_err(err, err_len, "out of memory"); return NULL; }
     chipseq *s = (chipseq *)malloc(sizeof *s);
-    if (!s) { free(buf); set_err(err, err_len, "out of memory"); return NULL; }
-    if (!chipseq_init(s, o)) {
-        free(s); free(buf);
-        set_err(err, err_len, "invalid options");
-        return NULL;
-    }
+    if (!s) { set_err(err, err_len, "out of memory"); return NULL; }
+    if (!chipseq_init(s, &selected)) { free(s); set_err(err, err_len, "invalid options"); return NULL; }
+    int16_t *buf = (int16_t *)malloc((size_t)n * sizeof(int16_t));
+    if (!buf) { chipseq_shutdown(s); free(s); set_err(err, err_len, "out of memory"); return NULL; }
     s->offline = true;
 
     char e2[128];
-    if (!chipseq_music_play(s, song, false, e2, sizeof e2)) {
+    bool play_loop = song->loop_order != CHIPSEQ_NO_LOOP;
+    if (!chipseq_music_play(s, song, play_loop, e2, sizeof e2)) {
         chipseq_shutdown(s); free(s); free(buf);
         set_err(err, err_len, "%s", e2);
         return NULL;
@@ -1525,16 +1769,31 @@ bool chipseq_bounce_wav(const chipseq_song *song, const chipseq_options *options
                         const char *path, uint64_t max_frames,
                         char *err, size_t err_len) {
     if (!path) { set_err(err, err_len, "path is NULL"); return false; }
+    if (!chipseq_song_validate(song, err, err_len)) return false;
     chipseq_options def;
     chipseq_options_init(&def);
-    const chipseq_options *o = options ? options : &def;
+    chipseq_options selected = options ? *options : def;
+    if (!options_are_valid(&selected)) {
+        set_err(err, err_len, "invalid options");
+        return false;
+    }
+
+    uint64_t expected_frames;
+    if (!resolve_render_length(song, selected.sample_rate, max_frames,
+                               &expected_frames, err, err_len))
+        return false;
+    const uint64_t wav_max_frames = ((uint64_t)UINT32_MAX - 36u) / sizeof(int16_t);
+    if (expected_frames > wav_max_frames) {
+        set_err(err, err_len, "WAV length exceeds the RIFF 32-bit size limit");
+        return false;
+    }
 
     size_t frames = 0;
-    int16_t *pcm = chipseq_render_song(song, o, max_frames, &frames, err, err_len);
+    int16_t *pcm = chipseq_render_song(song, &selected, max_frames, &frames, err, err_len);
     if (!pcm) return false;
 
-    uint32_t sr = o->sample_rate;
-    uint32_t data_bytes = (uint32_t)(frames * sizeof(int16_t));
+    uint32_t sr = selected.sample_rate;
+    uint32_t data_bytes = (uint32_t)((uint64_t)frames * sizeof(int16_t));
     uint8_t hdr[44];
     memcpy(hdr, "RIFF", 4);
     wav_put32(hdr + 4, 36u + data_bytes);
@@ -1554,8 +1813,20 @@ bool chipseq_bounce_wav(const chipseq_song *song, const chipseq_options *options
     if (!fp) { chipseq_pcm_free(pcm); set_err(err, err_len, "cannot open '%s'", path); return false; }
 
     bool ok = (fwrite(hdr, 1, sizeof hdr, fp) == sizeof hdr);
-    if (ok && data_bytes > 0)
-        ok = (fwrite(pcm, 1, data_bytes, fp) == data_bytes);
+    size_t offset = 0;
+    uint8_t bytes[4096u * sizeof(int16_t)];
+    while (ok && offset < frames) {
+        size_t count = frames - offset;
+        if (count > 4096u) count = 4096u;
+        for (size_t i = 0; i < count; i++) {
+            uint16_t value = (uint16_t)pcm[offset + i];
+            bytes[2u * i] = (uint8_t)(value & 0xFFu);
+            bytes[2u * i + 1u] = (uint8_t)(value >> 8);
+        }
+        size_t byte_count = count * sizeof(int16_t);
+        ok = fwrite(bytes, 1, byte_count, fp) == byte_count;
+        offset += count;
+    }
     if (fclose(fp) != 0) ok = false;
     chipseq_pcm_free(pcm);
     if (!ok) { set_err(err, err_len, "write failed for '%s'", path); return false; }
