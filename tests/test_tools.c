@@ -30,10 +30,19 @@ static int g_checks = 0;
 
 typedef struct { uint8_t *d; size_t n, cap; } buf;
 
+_Noreturn static void test_oom(void) {
+    fputs("test_tools: out of memory while building a fixture\n", stderr);
+    exit(EXIT_FAILURE);
+}
+
 static void bput(buf *b, uint8_t v) {
     if (b->n == b->cap) {
-        b->cap = b->cap ? b->cap * 2 : 128;
-        b->d = realloc(b->d, b->cap);
+        if (b->cap > SIZE_MAX / 2u) test_oom();
+        size_t new_cap = b->cap ? b->cap * 2u : 128u;
+        uint8_t *grown = realloc(b->d, new_cap);
+        if (!grown) test_oom();
+        b->d = grown;
+        b->cap = new_cap;
     }
     b->d[b->n++] = v;
 }
@@ -175,6 +184,17 @@ static void build_short_note_smf(buf *out) {
     free(t.d);
 }
 
+/* Preserve a declared silent tail ending exactly at a pattern boundary. */
+static void build_trailing_silence_smf(buf *out) {
+    put_smf_header(out, 1);
+    buf t = {0};
+    bput_vlq(&t, 0);   bput(&t, 0x90); bput(&t, 60); bput(&t, 100);
+    bput_vlq(&t, 48);  bput(&t, 0x80); bput(&t, 60); bput(&t, 0);
+    bput_vlq(&t, 720); bput(&t, 0xFF); bput(&t, 0x2F); bput(&t, 0);
+    append_mtrk(out, &t);
+    free(t.d);
+}
+
 /* ------------------------------------------------------------------------- */
 /* the import map (original instruments, with sequences to exercise emission) */
 /* ------------------------------------------------------------------------- */
@@ -300,6 +320,77 @@ int main(void) {
         CHECK(chipseq_midi_load(path, &map, err, sizeof err) == NULL,
               "midi_load rejects a declared but missing MTrk");
         CHECK(err[0] != 0, "missing-track rejection has an error message");
+
+        static const uint8_t missing_eot[] = {
+            'M','T','h','d', 0,0,0,6, 0,0, 0,1, 0,48,
+            'M','T','r','k', 0,0,0,3, 0,0xC0,0,
+        };
+        static const uint8_t status_as_data[] = {
+            'M','T','h','d', 0,0,0,6, 0,0, 0,1, 0,48,
+            'M','T','r','k', 0,0,0,8,
+            0,0x90,60,0x90, 0,0xFF,0x2F,0,
+        };
+        static const uint8_t after_eot[] = {
+            'M','T','h','d', 0,0,0,6, 0,0, 0,1, 0,48,
+            'M','T','r','k', 0,0,0,7,
+            0,0xFF,0x2F,0, 0,0xC0,0,
+        };
+        static const uint8_t zero_tempo[] = {
+            'M','T','h','d', 0,0,0,6, 0,0, 0,1, 0,48,
+            'M','T','r','k', 0,0,0,11,
+            0,0xFF,0x51,3,0,0,0, 0,0xFF,0x2F,0,
+        };
+        static const uint8_t wrong_tempo_length[] = {
+            'M','T','h','d', 0,0,0,6, 0,0, 0,1, 0,48,
+            'M','T','r','k', 0,0,0,10,
+            0,0xFF,0x51,2,7,0xA1, 0,0xFF,0x2F,0,
+        };
+        static const uint8_t nonzero_eot_length[] = {
+            'M','T','h','d', 0,0,0,6, 0,0, 0,1, 0,48,
+            'M','T','r','k', 0,0,0,5,
+            0,0xFF,0x2F,1,0,
+        };
+        static const uint8_t trailing_file_bytes[] = {
+            'M','T','h','d', 0,0,0,6, 0,0, 0,1, 0,48,
+            'M','T','r','k', 0,0,0,4, 0,0xFF,0x2F,0,
+            1,2,3,4,
+        };
+        static const uint8_t legacy_zero_pad[] = {
+            'M','T','h','d', 0,0,0,6, 0,0, 0,1, 0,48,
+            'M','T','r','k', 0,0,0,4, 0,0xFF,0x2F,0,
+            0,
+        };
+        struct malformed_case {
+            const uint8_t *bytes;
+            size_t size;
+            const char *message;
+        } cases[] = {
+            { missing_eot, sizeof missing_eot, "midi_load requires end-of-track" },
+            { status_as_data, sizeof status_as_data, "midi_load rejects a status byte as channel data" },
+            { after_eot, sizeof after_eot, "midi_load rejects data after end-of-track" },
+            { zero_tempo, sizeof zero_tempo, "midi_load rejects a zero tempo" },
+            { wrong_tempo_length, sizeof wrong_tempo_length,
+              "midi_load rejects a non-three-byte tempo" },
+            { nonzero_eot_length, sizeof nonzero_eot_length,
+              "midi_load rejects a nonzero end-of-track length" },
+            { trailing_file_bytes, sizeof trailing_file_bytes,
+              "midi_load rejects bytes after declared tracks" },
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            CHECK(write_all(path, cases[i].bytes, cases[i].size),
+                  "write strict-MIDI malformed fixture");
+            err[0] = 0;
+            chipseq_song *bad = chipseq_midi_load(path, &map, err, sizeof err);
+            CHECK(bad == NULL, cases[i].message);
+            CHECK(err[0] != 0, "strict-MIDI rejection has an error message");
+            chipseq_song_free(bad);
+        }
+        CHECK(write_all(path, legacy_zero_pad, sizeof legacy_zero_pad),
+              "write legacy zero-pad MIDI fixture");
+        err[0] = 0;
+        chipseq_song *padded = chipseq_midi_load(path, &map, err, sizeof err);
+        CHECK(padded != NULL, "midi_load accepts one inert legacy zero pad");
+        chipseq_song_free(padded);
         remove(path);
     }
 
@@ -362,6 +453,21 @@ int main(void) {
             CHECK(first->note == 60 && first->fx == CHIPSEQ_FX_NOTE_CUT && first->fxp == 1,
                   "zero-duration quantization becomes a one-fine-tick note, not a sustain");
             chipseq_song_free(short_song);
+        }
+
+        edge = (buf){0};
+        build_trailing_silence_smf(&edge);
+        CHECK(write_all(path, edge.d, edge.n), "write trailing-silence fixture");
+        free(edge.d);
+        chipseq_midi_map tail_map = map;
+        tail_map.channels = 1;
+        err[0] = 0;
+        chipseq_song *tail_song = chipseq_midi_load(path, &tail_map, err, sizeof err);
+        CHECK(tail_song != NULL, "load trailing-silence fixture");
+        if (tail_song) {
+            CHECK(tail_song->pattern_count == 4u,
+                  "end-of-track tail does not add a blank boundary pattern");
+            chipseq_song_free(tail_song);
         }
 
         edge = (buf){0};

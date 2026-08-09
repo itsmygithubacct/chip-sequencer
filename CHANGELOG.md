@@ -3,6 +3,37 @@
 All notable user-visible changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/) while its public API remains pre-1.0.
 
+## 0.3.0 - 2026-08-08
+
+### Added
+
+- A maintained benchmark covering idle, music, saturated SFX, command, and
+  validation paths.
+- Concurrent command, SFX-claim, mute, and snapshot coverage in the
+  ThreadSanitizer regression.
+
+### Changed
+
+- Idle rendering skips synthesis once streaming tails are empty; active
+  rendering bounds voice scans and shifts each decimator delay line once per
+  input pair.
+- WAV bounce streams bounded 4,096-frame chunks instead of retaining the whole
+  song and removes partial files after write failure.
+- MIDI import enforces a 64 MiB limit and strict track, data-byte, tempo,
+  end-of-track, and trailing-byte structure.
+- Strict warnings are build-breaking, dependency files are generated, and test
+  scratch output stays inside the selected build directory.
+
+### Fixed
+
+- Reject out-of-range duty effects and order jumps during song validation.
+- Make one-pole lowpass tails converge to exact silence instead of retaining a
+  permanent negative one-LSB offset.
+- Publish command-drained playhead state even while the engine is muted.
+- Publish the updated playhead when offline callers explicitly flush commands.
+- Treat MIDI end-of-track as an exclusive endpoint, preserving declared tails
+  without appending a blank pattern at an exact pattern boundary.
+
 ## 0.2.0 - 2026-07-22
 
 ### Added

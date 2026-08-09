@@ -28,7 +28,7 @@ sequence patterns and an order list with tempo, rows, ticks, and tracker
 effects; play one music song plus a small fixed pool of song-based SFX with
 per-channel SFX-preempts-music ducking; render to mono `int16`, interleaved
 stereo `int16`, or *add* to a `float` buffer; and bounce a whole song offline
-to a malloc'd PCM buffer or a canonical WAV. A separate, non-shipped
+to a malloc'd PCM buffer or stream it to a canonical WAV. A separate, non-shipped
 translation unit imports a Standard MIDI File and emits compilable C song
 literals.
 
@@ -46,15 +46,16 @@ make
 make test
 make sanitize
 make tsanitize
+make benchmark
 ```
 
 `make` builds `build/libchip-sequencer.a`, `build/libchip-sequencer.so`, and
 the `build/demo` example. `make test` runs the headless unit + golden suite
 (no audio hardware is touched). `make sanitize` reruns the suite under
 `-fsanitize=address,undefined`; `make tsanitize` exercises the documented
-game-thread/render-thread handoff under ThreadSanitizer. The core links no libm
-and needs no POSIX. `make install PREFIX=/usr/local` stages the header and
-libraries.
+game-thread/render-thread handoff under ThreadSanitizer. `make benchmark`
+records the principal render and control costs. The core links no libm and
+needs no POSIX. `make install PREFIX=/usr/local` stages the header and libraries.
 
 The public header is C11-only because the caller-owned `chipseq` object contains
 C11 atomics. It intentionally rejects inclusion from a C++ translation unit;
@@ -208,6 +209,26 @@ supported target and for every caller block partition. In-memory int16 byte
 order is native; WAV and golden-hash serialization is explicitly little-endian.
 The test suite pins a reference-song golden hash as the regression gate.
 
+Inactive engines take a bounded true-idle path, while active renders scan only
+the voice range owned by live tracks. The halfband decimator shifts each delay
+line once per input pair. `make benchmark` records idle, music-only, saturated
+music-plus-SFX, command, and validation costs so these paths remain measurable.
+
+## Offline formats
+
+`chipseq_bounce_wav` renders and writes in 4,096-frame chunks, so its memory use
+does not scale with song length. The WAV header and samples are explicitly
+little-endian, and a partial output is removed if a write fails.
+
+The offline MIDI importer accepts strict format-0/1 Standard MIDI Files up to
+64 MiB. Each declared track must end with a final, zero-length end-of-track
+event; status bytes in channel data, zero tempo, chunk overrun, and bytes after
+the declared tracks are rejected (apart from one inert legacy NUL pad). Import
+preserves the declared end-of-track tick as an exclusive endpoint, including
+silent tails, without appending a blank pattern when that endpoint is exactly
+on a pattern boundary. Import is intentionally a build-time tool: shipping
+games can link only `src/chip_sequencer.c`.
+
 ## Layout
 
 ```
@@ -218,8 +239,9 @@ tests/test_chipseq.c       headless unit + determinism-golden suite
 tests/test_tools.c         MIDI parse + byte-stable C emission tests
 tests/test_thread.c        concurrent snapshot regression under ThreadSanitizer
 examples/demo.c            build a song, bounce it, drive live blocks
+benchmarks/benchmark_chipseq.c maintained render/control microbenchmark
 CHANGELOG.md               user-visible changes by release
-Makefile                   all / test / sanitize / tsanitize / install / clean
+Makefile                   all / test / sanitize / tsanitize / benchmark / install / clean
 ```
 
 A consuming game vendors chip-sequencer as a submodule and compiles

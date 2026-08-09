@@ -52,7 +52,7 @@
 #endif
 
 #define CHIPSEQ_VERSION_MAJOR 0
-#define CHIPSEQ_VERSION_MINOR 2
+#define CHIPSEQ_VERSION_MINOR 3
 #define CHIPSEQ_VERSION_PATCH 0
 
 /* --- hard capacity limits baked into the object (nothing allocates) ------ */
@@ -235,7 +235,7 @@ typedef struct chipseq_options {
     uint8_t  mix_mode;    /* chipseq_mix_mode; default CHIPSEQ_MIX_LINEAR */
     float    volume;      /* master gain 0..1, quantized to 1/256; default 1.0 */
     float    sfx_duck;    /* music gain while any SFX plays, 0..1; default 1.0 */
-    uint16_t lowpass;     /* one-pole cutoff hint 0..65535 (0 = off); default 0 */
+    uint16_t lowpass;     /* convergent one-pole hint 0..65535 (0 = off); default 0 */
 } chipseq_options;
 
 /* --- internal state: treat every field below as private ------------------ */
@@ -361,9 +361,10 @@ bool chipseq_is_enabled(const chipseq *seq);
 
 /* Validate every order entry, instrument reference, sequence loop/release
  * index and value range, waveform parameter/table, PCM body/loop point, cell
- * value/effect, tempo field, and channel count. On the first problem writes a
- * message naming the offending pattern/row/channel/instrument into err (when
- * err_len > 0) and returns false. music/sfx play call this internally. */
+ * value/effect and bounded effect parameter, tempo field, and channel count.
+ * On the first problem writes a message naming the offending
+ * pattern/row/channel/instrument into err (when err_len > 0) and returns
+ * false. music/sfx play call this internally. */
 bool chipseq_song_validate(const chipseq_song *song, char *err, size_t err_len);
 
 /* Exact number of output frames the song renders at sample rate `sr`
@@ -444,8 +445,8 @@ void chipseq_render_f32(chipseq *seq, float *dst, size_t frames);
  * Pass to pcmmix_set_generator(&mixer, chipseq_generator, &seq). */
 void chipseq_generator(float *dst, size_t frames, void *user);
 
-/* Apply all queued commands NOW (for offline/test engines with no render
- * thread; a live renderer drains the queue itself each block). */
+/* Apply all queued commands and publish their playhead NOW (for offline/test
+ * engines with no render thread; a live renderer does both each block). */
 void chipseq_flush_commands(chipseq *seq);
 
 /* ======================================================================== */
@@ -468,10 +469,11 @@ int16_t *chipseq_render_song(const chipseq_song *song,
 /* Free a buffer from chipseq_render_song. NULL allowed. */
 void chipseq_pcm_free(int16_t *frames);
 
-/* Bounce a song straight to a canonical little-endian PCM/mono/16-bit WAV at
- * options->sample_rate -- the inverse of a strict WAV loader. Files exceeding
- * the 32-bit RIFF size limit are rejected before rendering. Returns false with
- * a reason in err on failure. */
+/* Stream a song straight to a canonical little-endian PCM/mono/16-bit WAV at
+ * options->sample_rate -- the inverse of a strict WAV loader. Only a bounded
+ * render block is retained in memory. Files exceeding the 32-bit RIFF size
+ * limit are rejected before rendering; a partial file is removed after a
+ * write failure. Returns false with a reason in err on failure. */
 bool chipseq_bounce_wav(const chipseq_song *song, const chipseq_options *options,
                         const char *path, uint64_t max_frames,
                         char *err, size_t err_len);
@@ -493,7 +495,11 @@ typedef struct chipseq_midi_map {
     bool     import_pitch_bend;
 } chipseq_midi_map;
 
-/* Parse a format-0/1 SMF and quantize it onto chip channels via `map`.
+/* Parse a strict format-0/1 SMF up to 64 MiB and quantize it onto chip channels
+ * via `map`. Every track must end with a final zero-length end-of-track event;
+ * channel data bytes, tempo values, declared chunks, and trailing data are
+ * validated (one inert legacy NUL pad is tolerated). The end-of-track tick is
+ * an exclusive endpoint, so an exact pattern boundary adds no blank pattern.
  * Returns a malloc'd song (free with chipseq_song_free) or NULL + err. */
 chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
                                 char *err, size_t err_len);

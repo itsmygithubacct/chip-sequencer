@@ -1,6 +1,7 @@
-/* ThreadSanitizer regression for the render-thread -> game-thread playhead
- * snapshot. The library owns no threads; this harness supplies the two foreign
- * threads that exercise the documented concurrent access pattern. */
+/* ThreadSanitizer regression for the documented game-thread/render-thread
+ * handoff: commands and claims flow to the renderer while playhead/claim
+ * snapshots and the direct mute flag flow back. The library owns no threads;
+ * this harness supplies the two foreign threads. */
 #include "chip_sequencer.h"
 
 #include <pthread.h>
@@ -29,6 +30,7 @@ static const chipseq_song song = {
 static chipseq seq;
 static atomic_bool done;
 static atomic_uint positions_read;
+static atomic_uint operations;
 
 static void *render_thread(void *unused) {
     (void)unused;
@@ -41,11 +43,55 @@ static void *render_thread(void *unused) {
 
 static void *game_thread(void *unused) {
     (void)unused;
+    unsigned iteration = 0u;
+    int handle = -1;
     while (!atomic_load_explicit(&done, memory_order_acquire)) {
         uint16_t order_pos, row;
         uint8_t tick;
         if (chipseq_music_position(&seq, &order_pos, &row, &tick))
             atomic_fetch_add_explicit(&positions_read, 1u, memory_order_relaxed);
+
+        switch (iteration & 255u) {
+        case 0u:
+            (void)chipseq_music_set_volume(
+                &seq, (float)(iteration & 127u) * (1.0f / 127.0f));
+            break;
+        case 32u:
+            (void)chipseq_music_set_paused(&seq, true);
+            break;
+        case 48u:
+            (void)chipseq_music_set_paused(&seq, false);
+            break;
+        case 96u:
+            (void)chipseq_music_stop(&seq, 0u);
+            break;
+        case 112u: {
+            char error[96];
+            (void)chipseq_music_play(&seq, &song, true, error, sizeof error);
+            break;
+        }
+        case 160u:
+            chipseq_set_enabled(&seq, false);
+            break;
+        case 161u:
+            chipseq_set_enabled(&seq, true);
+            break;
+        default:
+            break;
+        }
+
+        if ((iteration & 31u) == 0u) {
+            if (handle > 0 && chipseq_sfx_active(&seq, handle)) {
+                if ((iteration & 64u) != 0u)
+                    (void)chipseq_sfx_stop(&seq, handle);
+                else
+                    (void)chipseq_sfx_set(&seq, handle, 0.5f, 3);
+            } else {
+                handle = chipseq_sfx_play(&seq, &song, 0.75f, -2, false);
+            }
+        }
+        atomic_fetch_add_explicit(&operations, 1u, memory_order_relaxed);
+        iteration++;
     }
     return NULL;
 }
@@ -66,6 +112,7 @@ int main(void) {
 
     atomic_init(&done, false);
     atomic_init(&positions_read, 0u);
+    atomic_init(&operations, 0u);
     pthread_t renderer, game;
     if (pthread_create(&renderer, NULL, render_thread, NULL) != 0 ||
         pthread_create(&game, NULL, game_thread, NULL) != 0)
@@ -74,11 +121,13 @@ int main(void) {
         return 1;
 
     unsigned reads = atomic_load_explicit(&positions_read, memory_order_relaxed);
+    unsigned ops = atomic_load_explicit(&operations, memory_order_relaxed);
     chipseq_shutdown(&seq);
-    if (reads == 0) {
-        fprintf(stderr, "thread snapshot reader made no progress\n");
+    if (reads == 0 || ops == 0) {
+        fprintf(stderr, "thread game-side worker made no progress\n");
         return 1;
     }
-    printf("test_thread: OK (%u coherent snapshots)\n", reads);
+    printf("test_thread: OK (%u coherent snapshots, %u control operations)\n",
+           reads, ops);
     return 0;
 }

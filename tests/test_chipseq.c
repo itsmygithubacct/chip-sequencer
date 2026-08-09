@@ -294,6 +294,30 @@ static void test_validation(void) {
         CHECK(!chipseq_song_validate(&s, err, sizeof err), "reject cell volume > 64");
         CHECK(has(err, "volume"), "bad-volume error names volume");
     }
+    /* Effect parameters that index bounded song/synth state are validated. */
+    {
+        static const chipseq_cell bp[] = {
+            { CHIPSEQ_NOTE_NONE, 0, CHIPSEQ_VOL_NONE, CHIPSEQ_FX_DUTY, 64 }, CS__,
+            CS__, CS__,
+        };
+        static const chipseq_pattern bpat[] = { { bp, 2 } };
+        chipseq_song s = base_song; s.patterns = bpat;
+        err[0] = 0;
+        CHECK(!chipseq_song_validate(&s, err, sizeof err), "reject FX_DUTY > 63");
+        CHECK(has(err, "duty"), "bad FX_DUTY error names duty");
+    }
+    {
+        static const chipseq_cell bp[] = {
+            { CHIPSEQ_NOTE_NONE, 0, CHIPSEQ_VOL_NONE, CHIPSEQ_FX_ORDER_JUMP, 1 }, CS__,
+            CS__, CS__,
+        };
+        static const chipseq_pattern bpat[] = { { bp, 2 } };
+        chipseq_song s = base_song; s.patterns = bpat;
+        err[0] = 0;
+        CHECK(!chipseq_song_validate(&s, err, sizeof err),
+              "reject FX_ORDER_JUMP outside the order list");
+        CHECK(has(err, "order jump"), "bad order-jump error names the effect");
+    }
     /* zero-row pattern */
     {
         static const chipseq_pattern zpat[] = { { base_p0, 0 } };
@@ -428,6 +452,13 @@ static void test_f32_identity(void) {
     const size_t BLK = 4096;
     int16_t *s16 = malloc(BLK * sizeof(int16_t));
     float   *f32 = malloc(BLK * sizeof(float));
+    CHECK(s16 != NULL && f32 != NULL, "allocate f32 identity buffers");
+    if (!s16 || !f32) {
+        free(s16); free(f32);
+        chipseq_shutdown(&s16eng);
+        chipseq_shutdown(&f32eng);
+        return;
+    }
     int exact = 1;
     uint64_t done = 0;
     while (done < total) {
@@ -493,6 +524,40 @@ static void test_command_queue(void) {
         uint16_t op, row; uint8_t tk;
         CHECK(chipseq_music_position(&seq, &op, &row, &tk),
               "stop-then-play leaves music playing (issue order honored)");
+        chipseq_shutdown(&seq);
+    }
+
+    /* A muted block still drains commands and publishes their new playhead. */
+    {
+        chipseq seq; CHECK(chipseq_init(&seq, &opt), "init muted snapshot");
+        CHECK(chipseq_music_play(&seq, &ref_song, false, err, sizeof err),
+              "queue play before muted snapshot test");
+        int16_t sample;
+        chipseq_render_s16(&seq, &sample, 1);
+        CHECK(chipseq_music_stop(&seq, 0), "queue stop before muting");
+        chipseq_set_enabled(&seq, false);
+        sample = 1;
+        chipseq_render_s16(&seq, &sample, 1);
+        uint16_t op, row; uint8_t tk;
+        CHECK(sample == 0, "muted render overwrites s16 output with silence");
+        CHECK(!chipseq_music_position(&seq, &op, &row, &tk),
+              "muted render publishes the command-drained stopped state");
+        chipseq_shutdown(&seq);
+    }
+
+    /* Explicit offline flushing publishes the same coherent state as render. */
+    {
+        chipseq seq; CHECK(chipseq_init(&seq, &opt), "init flush snapshot");
+        CHECK(chipseq_music_play(&seq, &ref_song, false, err, sizeof err),
+              "queue play before explicit flush");
+        chipseq_flush_commands(&seq);
+        uint16_t op, row; uint8_t tk;
+        CHECK(chipseq_music_position(&seq, &op, &row, &tk),
+              "flush_commands publishes the started playhead");
+        CHECK(chipseq_music_stop(&seq, 0), "queue stop before explicit flush");
+        chipseq_flush_commands(&seq);
+        CHECK(!chipseq_music_position(&seq, &op, &row, &tk),
+              "flush_commands publishes the stopped playhead");
         chipseq_shutdown(&seq);
     }
 
@@ -947,6 +1012,33 @@ static void test_block_partition_invariance(void) {
     }
     CHECK(memcmp(whole, split, total * sizeof *whole) == 0,
           "SFX end and duck release are block-partition invariant");
+    chipseq_shutdown(&a); chipseq_shutdown(&b);
+
+    /* A lowpass tail must converge to exact silence, including when caller
+     * block boundaries differ. This also enables the true-idle fast path. */
+    memset(whole, 0, total * sizeof *whole);
+    memset(split, 0, total * sizeof *split);
+    chipseq_options_init(&opt);
+    opt.lowpass = 32768u;
+    CHECK(chipseq_init(&a, &opt) && chipseq_init(&b, &opt),
+          "initialize lowpass-tail partition engines");
+    CHECK(chipseq_music_play(&a, &sfx_oneshot, false, err, sizeof err) &&
+          chipseq_music_play(&b, &sfx_oneshot, false, err, sizeof err),
+          "start lowpass-tail partition fixture");
+    chipseq_render_s16(&a, whole, total);
+    done = 0;
+    while (done < total) {
+        size_t chunk = total - done > 13u ? 13u : total - done;
+        chipseq_render_s16(&b, split + done, chunk);
+        done += chunk;
+    }
+    CHECK(memcmp(whole, split, total * sizeof *whole) == 0,
+          "lowpass tail is block-partition invariant");
+    bool exact_silence = true;
+    for (size_t i = total - 64u; i < total; i++)
+        if (whole[i] != 0) { exact_silence = false; break; }
+    CHECK(exact_silence && a.lp_mono == 0 && b.lp_mono == 0,
+          "lowpass tail converges to exact zero instead of a permanent -1 LSB");
     chipseq_shutdown(&a); chipseq_shutdown(&b);
     free(whole); free(split);
 }

@@ -102,6 +102,24 @@ static uint16_t rd_be16(const uint8_t *p) {
     return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
+static bool channel_data_is_valid(const uint8_t *p, const uint8_t *end,
+                                  size_t count, const char *kind,
+                                  char *err, size_t err_len) {
+    if ((size_t)(end - p) < count) {
+        tools_set_err(err, err_len, "truncated %s", kind);
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if ((p[i] & 0x80u) != 0u) {
+            tools_set_err(err, err_len,
+                          "status byte 0x%02X in %s data",
+                          (unsigned)p[i], kind);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Decode a variable-length quantity. Advances *pp; sets *ok. */
 static uint32_t read_vlq(const uint8_t **pp, const uint8_t *end, bool *ok) {
     uint32_t v = 0;
@@ -120,7 +138,7 @@ static uint32_t read_vlq(const uint8_t **pp, const uint8_t *end, bool *ok) {
 /* Append every relevant event of one MTrk chunk [p,end) into `evs`, tagging
  * each with a monotonically increasing seq from *seqp for a stable sort. */
 static bool parse_track(const uint8_t *p, const uint8_t *end, vec *evs,
-                        uint64_t *seqp, bool import_bend,
+                        uint64_t *seqp, uint64_t *end_tick, bool import_bend,
                         char *err, size_t err_len) {
     uint64_t abstick = 0;
     uint8_t status = 0;
@@ -157,17 +175,37 @@ static bool parse_track(const uint8_t *p, const uint8_t *end, vec *evs,
                 tools_set_err(err, err_len, "truncated meta payload");
                 return false;
             }
-            if (mtype == 0x51u && mlen == 3u) {      /* set tempo */
+            if (mtype == 0x51u) {                    /* set tempo */
+                if (mlen != 3u) {
+                    tools_set_err(err, err_len, "set-tempo length must be 3");
+                    return false;
+                }
                 uint32_t usec = ((uint32_t)p[0] << 16) |
                                 ((uint32_t)p[1] << 8) | (uint32_t)p[2];
+                if (usec == 0u) {
+                    tools_set_err(err, err_len, "set-tempo value must be nonzero");
+                    return false;
+                }
                 mev *e = vec_push(evs);
                 if (!e) return false;
                 e->tick = abstick; e->seq = (*seqp)++;
-                e->type = MEV_TEMPO; e->d3 = usec ? usec : 500000u;
+                e->type = MEV_TEMPO; e->d3 = usec;
             }
-            /* 0x58 time-sig and 0x2F end-of-track are recognized-and-skipped;
-             * every other meta is skipped by length. */
+            if (mtype == 0x2Fu && mlen != 0u) {
+                tools_set_err(err, err_len, "end-of-track length must be zero");
+                return false;
+            }
+            /* 0x58 time-sig is recognized-and-skipped; every other meta is
+             * skipped by its declared length. End-of-track must end the chunk. */
             p += mlen;
+            if (mtype == 0x2Fu) {
+                if (p != end) {
+                    tools_set_err(err, err_len, "data follows end-of-track");
+                    return false;
+                }
+                *end_tick = abstick;
+                return true;
+            }
             status = 0;                              /* meta clears running status */
         } else if (status == 0xF0u || status == 0xF7u) { /* sysex */
             uint32_t slen = read_vlq(&p, end, &ok);
@@ -180,7 +218,8 @@ static bool parse_track(const uint8_t *p, const uint8_t *end, vec *evs,
         } else {                                     /* channel voice message */
             switch (hi) {
             case 0x80: {                             /* note off */
-                if ((size_t)(end - p) < 2) { tools_set_err(err, err_len, "truncated note-off"); return false; }
+                if (!channel_data_is_valid(p, end, 2u, "note-off", err, err_len))
+                    return false;
                 uint8_t note = p[0]; p += 2;
                 mev *e = vec_push(evs);
                 if (!e) return false;
@@ -189,7 +228,8 @@ static bool parse_track(const uint8_t *p, const uint8_t *end, vec *evs,
                 break;
             }
             case 0x90: {                             /* note on (vel 0 == off) */
-                if ((size_t)(end - p) < 2) { tools_set_err(err, err_len, "truncated note-on"); return false; }
+                if (!channel_data_is_valid(p, end, 2u, "note-on", err, err_len))
+                    return false;
                 uint8_t note = p[0], vel = p[1]; p += 2;
                 mev *e = vec_push(evs);
                 if (!e) return false;
@@ -200,11 +240,13 @@ static bool parse_track(const uint8_t *p, const uint8_t *end, vec *evs,
             }
             case 0xA0:                               /* poly aftertouch: 2 bytes */
             case 0xB0:                               /* control change:  2 bytes */
-                if ((size_t)(end - p) < 2) { tools_set_err(err, err_len, "truncated 2-byte msg"); return false; }
+                if (!channel_data_is_valid(p, end, 2u, "two-byte message", err, err_len))
+                    return false;
                 p += 2;
                 break;
             case 0xC0: {                             /* program change: 1 byte */
-                if ((size_t)(end - p) < 1) { tools_set_err(err, err_len, "truncated program"); return false; }
+                if (!channel_data_is_valid(p, end, 1u, "program-change", err, err_len))
+                    return false;
                 uint8_t prog = *p++;
                 mev *e = vec_push(evs);
                 if (!e) return false;
@@ -213,11 +255,13 @@ static bool parse_track(const uint8_t *p, const uint8_t *end, vec *evs,
                 break;
             }
             case 0xD0:                               /* channel pressure: 1 byte */
-                if ((size_t)(end - p) < 1) { tools_set_err(err, err_len, "truncated pressure"); return false; }
+                if (!channel_data_is_valid(p, end, 1u, "channel-pressure", err, err_len))
+                    return false;
                 p += 1;
                 break;
             case 0xE0: {                             /* pitch bend: 2 bytes */
-                if ((size_t)(end - p) < 2) { tools_set_err(err, err_len, "truncated bend"); return false; }
+                if (!channel_data_is_valid(p, end, 2u, "pitch-bend", err, err_len))
+                    return false;
                 uint8_t lo = p[0], mhi = p[1]; p += 2;
                 if (import_bend) {
                     mev *e = vec_push(evs);
@@ -234,7 +278,8 @@ static bool parse_track(const uint8_t *p, const uint8_t *end, vec *evs,
             }
         }
     }
-    return true;
+    tools_set_err(err, err_len, "track is missing end-of-track");
+    return false;
 }
 
 static int mev_cmp(const void *a, const void *b) {
@@ -250,7 +295,8 @@ static int mev_cmp(const void *a, const void *b) {
 /* quantization onto chip channels                                           */
 /* ------------------------------------------------------------------------- */
 
-#define TOOLS_MAX_ROWS (1u << 20)
+#define TOOLS_MAX_ROWS       (1u << 20)
+#define TOOLS_MAX_MIDI_BYTES (64u * 1024u * 1024u)
 
 typedef struct {
     uint64_t start_fine, end_fine;
@@ -320,8 +366,10 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
 
     if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); tools_set_err(err, err_len, "midi_load: seek failed"); return NULL; }
     long fsz = ftell(fp);
+    if (fsz < 0) { fclose(fp); tools_set_err(err, err_len, "midi_load: size query failed"); return NULL; }
     if (fsz < 14) { fclose(fp); tools_set_err(err, err_len, "midi_load: file too small for an SMF"); return NULL; }
-    if ((uintmax_t)fsz > (uintmax_t)SIZE_MAX) {
+    if ((uintmax_t)fsz > (uintmax_t)SIZE_MAX ||
+        (uintmax_t)fsz > (uintmax_t)TOOLS_MAX_MIDI_BYTES) {
         fclose(fp); tools_set_err(err, err_len, "midi_load: file is too large"); return NULL;
     }
     size_t file_size = (size_t)fsz;
@@ -376,6 +424,7 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
     const uint8_t *p = buf + 8 + hlen;
     const uint8_t *fend = buf + file_size;
     uint64_t seq = 0;
+    uint64_t midi_end_tick = 0;
     unsigned tracks_seen = 0;
     while (tracks_seen < ntracks) {
         if ((size_t)(fend - p) < 8u) {
@@ -388,14 +437,23 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
         if ((size_t)(fend - tstart) < (size_t)tlen) {
             tools_set_err(err, err_len, "midi_load: MTrk overruns file"); goto fail;
         }
-        if (!parse_track(tstart, tstart + tlen, &evs, &seq,
+        uint64_t track_end_tick = 0;
+        if (!parse_track(tstart, tstart + tlen, &evs, &seq, &track_end_tick,
                          map->import_pitch_bend, err, err_len)) {
             if (!err || err_len == 0 || err[0] == '\0')
                 tools_set_err(err, err_len, "midi_load: out of memory while parsing events");
             goto fail;
         }
+        if (track_end_tick > midi_end_tick) midi_end_tick = track_end_tick;
         p = tstart + tlen;
         tracks_seen++;
+    }
+    /* A few legacy writers append one NUL to word-align the complete file even
+     * though the SMF chunk length excludes it. Accept that inert pad only;
+     * reject every other byte after the declared track set. */
+    if (p != fend && !((size_t)(fend - p) == 1u && p[0] == 0u)) {
+        tools_set_err(err, err_len, "midi_load: trailing bytes after declared tracks");
+        goto fail;
     }
 
     /* --- stable time sort --- */
@@ -436,6 +494,10 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
     memset(col_vol, 0, sizeof col_vol);
 
     uint64_t max_fine = 0;
+    if (!to_fine(midi_end_tick, rpb, tpr, division, &max_fine)) {
+        tools_set_err(err, err_len, "midi_load: track end overflows quantized timeline");
+        goto fail;
+    }
     unsigned dropped = 0;
 
     for (size_t i = 0; i < evs.len; i++) {
@@ -510,17 +572,17 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
     /* finalize any notes still held at end-of-song */
     for (unsigned c = 0; c < chans; c++) {
         if (col_busy[c]) {
-            if (max_fine > UINT64_MAX - tpr) {
-                tools_set_err(err, err_len, "midi_load: held-note end overflows uint64");
-                goto fail;
-            }
             placement *pl = vec_push(&places);
             if (!pl) goto oom;
             pl->col = (uint8_t)c;
             pl->mchan = col_mchan[c];
             pl->note = col_note[c]; pl->inst = col_inst[c]; pl->vol = col_vol[c];
             pl->start_fine = col_start[c];
-            pl->end_fine = max_fine + (uint64_t)tpr; /* ring to the next row */
+            if (!normalize_note_end(pl->start_fine, max_fine, tpr,
+                                    &pl->end_fine)) {
+                tools_set_err(err, err_len, "midi_load: held-note end overflows uint64");
+                goto fail;
+            }
             col_busy[c] = false;
         }
     }
@@ -532,13 +594,18 @@ chipseq_song *chipseq_midi_load(const char *path, const chipseq_midi_map *map,
         for (size_t i = 0; i < places.len; i++)
             if (pls[i].end_fine > end_fine_max) end_fine_max = pls[i].end_fine;
     }
-    uint64_t last_row = end_fine_max / (uint64_t)tpr;
-    if (last_row >= TOOLS_MAX_ROWS) {
+    /* end_fine_max is an exclusive timeline endpoint. At an exact row (or
+     * pattern) boundary, that boundary does not itself occupy another row.
+     * The padded final pattern still provides a cell for a note-off whenever
+     * the endpoint falls before that pattern's end. */
+    uint64_t total_rows64 = end_fine_max / (uint64_t)tpr;
+    if (end_fine_max % (uint64_t)tpr != 0u) total_rows64++;
+    if (total_rows64 == 0u) total_rows64 = 1u;
+    if (total_rows64 > TOOLS_MAX_ROWS) {
         tools_set_err(err, err_len, "midi_load: song exceeds the %u-row limit",
                       TOOLS_MAX_ROWS);
         goto fail;
     }
-    uint64_t total_rows64 = last_row + 1u;
     unsigned total_rows = (unsigned)total_rows64;
     unsigned rpp = map->rows_per_pattern;
     unsigned npat = (total_rows + rpp - 1u) / rpp;
