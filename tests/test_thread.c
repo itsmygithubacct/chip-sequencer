@@ -31,6 +31,7 @@ static chipseq seq;
 static atomic_bool done;
 static atomic_uint positions_read;
 static atomic_uint operations;
+static uint32_t next_generation = 1u;
 
 static void *render_thread(void *unused) {
     (void)unused;
@@ -46,9 +47,8 @@ static void *game_thread(void *unused) {
     unsigned iteration = 0u;
     int handle = -1;
     while (!atomic_load_explicit(&done, memory_order_acquire)) {
-        uint16_t order_pos, row;
-        uint8_t tick;
-        if (chipseq_music_position(&seq, &order_pos, &row, &tick))
+        chipseq_playhead playhead;
+        if (chipseq_music_snapshot(&seq, &playhead) && playhead.active)
             atomic_fetch_add_explicit(&positions_read, 1u, memory_order_relaxed);
 
         switch (iteration & 255u) {
@@ -62,6 +62,25 @@ static void *game_thread(void *unused) {
         case 48u:
             (void)chipseq_music_set_paused(&seq, false);
             break;
+        case 64u: {
+            chipseq_channel_mix mix;
+            chipseq_channel_mix_init(&mix);
+            mix.pan[0] = (uint8_t)(iteration & 255u);
+            (void)chipseq_music_set_channel_mix(&seq, &mix);
+            break;
+        }
+        case 80u:
+            (void)chipseq_music_set_swing(
+                &seq, (uint8_t)(50u + iteration % 26u));
+            break;
+        case 88u: {
+            char error[96];
+            (void)chipseq_music_replace(
+                &seq, &song, true, CHIPSEQ_REPLACE_NEXT_ROW,
+                CHIPSEQ_REPLACE_PRESERVE_POSITION, next_generation++,
+                error, sizeof error);
+            break;
+        }
         case 96u:
             (void)chipseq_music_stop(&seq, 0u);
             break;

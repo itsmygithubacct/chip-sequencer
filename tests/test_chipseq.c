@@ -15,7 +15,8 @@
  *   7. chipseq_bounce_wav round-trips against a strict PCM/mono/16-bit reader
  *   8. tick timing scales across sample rates (44100 vs 48000)
  *   9. render output is invariant to caller block partitioning
- *  10. lifecycle/numeric edge cases and synth-control regressions
+ *  10. live channel controls, swing, replacement, and extended snapshots
+ *  11. lifecycle/numeric edge cases and synth-control regressions
  */
 #include "chip_sequencer.h"
 
@@ -607,7 +608,176 @@ static void test_command_queue(void) {
 }
 
 /* ======================================================================== */
-/* 5. SFX voice stealing                                                     */
+/* 5. live music controls                                                    */
+/* ======================================================================== */
+
+static void test_live_music_controls(void) {
+    char err[128];
+    chipseq_options opt;
+    chipseq_options_init(&opt);
+    opt.sample_rate = 8000u;
+    opt.oversample = 1u;
+
+    /* A batch is centered/unity by default, rejects invalid gain, and applies
+     * gain, mute, and pan together at the next render boundary. */
+    {
+        chipseq_channel_mix mix;
+        chipseq_channel_mix_init(&mix);
+        bool defaults = mix.mute_mask == 0u;
+        for (uint8_t c = 0u; c < CHIPSEQ_CHANNELS_MAX; ++c)
+            defaults = defaults && mix.gain[c] == 1.0f && mix.pan[c] == 128u;
+        CHECK(defaults, "channel-mix initializer returns unity/center/unmuted");
+
+        chipseq seq;
+        CHECK(chipseq_init(&seq, &opt), "init live channel-mix engine");
+        CHECK(chipseq_music_play(&seq, &base_song, true, err, sizeof err),
+              "start live channel-mix song");
+        chipseq_flush_commands(&seq);
+        mix.pan[0] = 0u;
+        mix.gain[1] = 0.0f;
+        mix.mute_mask = (uint8_t)(1u << 1);
+        CHECK(chipseq_music_set_channel_mix(&seq, &mix),
+              "queue atomic channel-mix batch");
+        chipseq_flush_commands(&seq);
+        CHECK(seq.music_channel_gain_q8[0] == 256u &&
+              seq.music_channel_gain_q8[1] == 0u &&
+              seq.music_channel_pan[0] == 0u &&
+              seq.music_channel_mute_mask == (uint8_t)(1u << 1),
+              "channel-mix batch is applied without partial state");
+        mix.gain[0] = NAN;
+        CHECK(!chipseq_music_set_channel_mix(&seq, &mix),
+              "channel-mix rejects NaN gain");
+        mix.gain[0] = 1.01f;
+        CHECK(!chipseq_music_set_channel_mix(&seq, &mix),
+              "channel-mix rejects gain above unity");
+        chipseq_shutdown(&seq);
+    }
+
+    /* Inactive swing takes effect on row zero. The two row durations retain
+     * exactly twice the straight Q32 tick duration. */
+    {
+        chipseq seq;
+        CHECK(chipseq_init(&seq, &opt), "init swing engine");
+        CHECK(chipseq_music_play(&seq, &base_song, true, err, sizeof err),
+              "start straight timing reference");
+        chipseq_flush_commands(&seq);
+        uint64_t straight_tick = seq.music.samples_per_tick;
+        chipseq_shutdown(&seq);
+        CHECK(chipseq_init(&seq, &opt), "reinit swing engine");
+        CHECK(!chipseq_music_set_swing(&seq, 49u) &&
+              !chipseq_music_set_swing(&seq, 76u),
+              "swing rejects values outside 50..75");
+        CHECK(chipseq_music_set_swing(&seq, 75u), "queue 75-percent swing");
+        chipseq_flush_commands(&seq);
+        CHECK(chipseq_music_play(&seq, &base_song, true, err, sizeof err),
+              "start swung song");
+        chipseq_flush_commands(&seq);
+        uint64_t pair_ticks = straight_tick * 2u;
+        uint64_t long_tick = (pair_ticks * 75u) / 100u;
+        uint64_t short_tick = pair_ticks - long_tick;
+        CHECK(seq.music.samples_per_tick == long_tick,
+              "even swing row uses the long tick duration");
+        int16_t *frames = malloc(1500u * sizeof *frames);
+        CHECK(frames != NULL, "allocate swing timing buffer");
+        if (frames) {
+            chipseq_render_s16(&seq, frames, 1500u);
+            CHECK(seq.music.rows_elapsed == 1u &&
+                  seq.music.samples_per_tick == short_tick,
+                  "odd swing row uses the short tick duration");
+            chipseq_render_s16(&seq, frames, 500u);
+            CHECK(seq.music.rows_elapsed == 2u &&
+                  seq.music.samples_per_tick == long_tick,
+                  "a swing row pair preserves its straight total duration");
+        }
+        free(frames);
+        chipseq_shutdown(&seq);
+    }
+
+    /* Replacements keep immutable caller data live until a coherent snapshot
+     * acknowledges its generation. Preserve-position maps the monotonic row
+     * count into the new order; restart begins at zero. */
+    {
+        chipseq seq;
+        CHECK(chipseq_init(&seq, &opt), "init replacement engine");
+        CHECK(!chipseq_music_replace(&seq, &base_song, true,
+                                     (chipseq_replace_boundary)-1,
+                                     CHIPSEQ_REPLACE_RESTART, 1u,
+                                     err, sizeof err) &&
+              !chipseq_music_replace(&seq, &base_song, true,
+                                     CHIPSEQ_REPLACE_NEXT_ROW,
+                                     (chipseq_replace_mode)-1, 1u,
+                                     err, sizeof err),
+              "replacement rejects negative enum values");
+        CHECK(chipseq_music_play(&seq, &base_song, true, err, sizeof err),
+              "start replacement source song");
+        chipseq_flush_commands(&seq);
+        int16_t *frames = malloc(1000u * sizeof *frames);
+        CHECK(frames != NULL, "allocate replacement timing buffer");
+        if (frames) chipseq_render_s16(&seq, frames, 1000u);
+        chipseq_playhead before;
+        CHECK(chipseq_music_snapshot(&seq, &before) && before.active &&
+              before.rows_elapsed == 1u && before.applied_generation == 0u,
+              "extended snapshot reports monotonic rows before replacement");
+        CHECK(chipseq_music_replace(&seq, &ref_song, true,
+                                    CHIPSEQ_REPLACE_NEXT_ROW,
+                                    CHIPSEQ_REPLACE_PRESERVE_POSITION, 1u,
+                                    err, sizeof err),
+              "queue next-row preserve-position replacement");
+        CHECK(!chipseq_music_replace(&seq, &ref_song, true,
+                                     CHIPSEQ_REPLACE_NEXT_ROW,
+                                     CHIPSEQ_REPLACE_PRESERVE_POSITION, 1u,
+                                     err, sizeof err),
+              "replacement generation must increase monotonically");
+        chipseq_flush_commands(&seq);
+        chipseq_playhead pending;
+        CHECK(chipseq_music_snapshot(&seq, &pending) &&
+              pending.applied_generation == 0u,
+              "queued generation is not acknowledged before its boundary");
+        if (frames) chipseq_render_s16(&seq, frames, 1000u);
+        chipseq_playhead applied;
+        CHECK(chipseq_music_snapshot(&seq, &applied) && applied.active &&
+              applied.applied_generation == 1u &&
+              applied.rows_elapsed == 2u && applied.row == 2u,
+              "next-row replacement acknowledges and preserves position");
+
+        CHECK(chipseq_music_replace(&seq, &base_song, true,
+                                    CHIPSEQ_REPLACE_NEXT_BEAT,
+                                    CHIPSEQ_REPLACE_RESTART, 2u,
+                                    err, sizeof err),
+              "queue next-beat restart replacement");
+        chipseq_flush_commands(&seq);
+        if (frames) chipseq_render_s16(&seq, frames, 1000u);
+        CHECK(chipseq_music_snapshot(&seq, &pending) &&
+              pending.applied_generation == 1u,
+              "next-beat replacement remains pending before beat boundary");
+        if (frames) chipseq_render_s16(&seq, frames, 1000u);
+        CHECK(chipseq_music_snapshot(&seq, &applied) && applied.active &&
+              applied.applied_generation == 2u && applied.rows_elapsed == 0u &&
+              applied.order_pos == 0u && applied.row == 0u,
+              "next-beat restart replacement begins from row zero");
+        free(frames);
+        chipseq_shutdown(&seq);
+    }
+    {
+        chipseq seq;
+        CHECK(chipseq_init(&seq, &opt), "init inactive replacement engine");
+        CHECK(chipseq_music_replace(&seq, &base_song, true,
+                                    CHIPSEQ_REPLACE_NEXT_BEAT,
+                                    CHIPSEQ_REPLACE_RESTART, 1u,
+                                    err, sizeof err),
+              "replacement can start an inactive engine");
+        chipseq_flush_commands(&seq);
+        chipseq_playhead applied;
+        CHECK(chipseq_music_snapshot(&seq, &applied) && applied.active &&
+              applied.applied_generation == 1u &&
+              seq.music.generation == 256u,
+              "inactive replacement acknowledges at unity music volume");
+        chipseq_shutdown(&seq);
+    }
+}
+
+/* ======================================================================== */
+/* 6. SFX voice stealing                                                     */
 /* ======================================================================== */
 
 static void test_sfx_stealing(void) {
@@ -1055,6 +1225,9 @@ static void test_lifecycle_and_numeric_inputs(void) {
     CHECK(chipseq_init(&seq, &good), "initial valid init succeeds");
     CHECK(atomic_is_lock_free(&seq.queue_head) && atomic_is_lock_free(&seq.queue_tail) &&
           atomic_is_lock_free(&seq.sfx_claim[0]) && atomic_is_lock_free(&seq.snap_seq) &&
+          atomic_is_lock_free(&seq.snap_generation) &&
+          atomic_is_lock_free(&seq.snap_rows_low) &&
+          atomic_is_lock_free(&seq.snap_rows_high) &&
           atomic_is_lock_free(&seq.enabled),
           "every render/game handshake is lock-free on this supported target");
     bad = good; bad.sample_rate = 1;
@@ -1346,6 +1519,7 @@ int main(void) {
     test_determinism_golden();
     test_f32_identity();
     test_command_queue();
+    test_live_music_controls();
     test_sfx_stealing();
     test_song_frames();
     test_offline_length_and_looping();

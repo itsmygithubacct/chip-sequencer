@@ -148,6 +148,29 @@ pcmmix_stop(&mixer);
 chipseq_shutdown(&seq);
 ```
 
+## Live editing controls
+
+Version 0.4 adds the controls needed by terminal instruments and trackers that
+edit a running arrangement. `chipseq_music_set_channel_mix` submits gain, pan,
+and mute for all eight music channels in one render-boundary command.
+`chipseq_music_set_swing` accepts 50 (straight) through 75 percent and changes
+timing on the next row; each even/odd row pair keeps the same total duration as
+straight timing.
+
+`chipseq_music_replace` swaps a validated, immutable song at the next row or
+beat. It can preserve the monotonic row position or restart from row zero. Each
+replacement carries a nonzero, monotonically increasing generation. The
+control thread keeps the old and candidate song storage alive until
+`chipseq_music_snapshot` publishes that generation (or a later one); at that
+point the render thread no longer references the retired data. The extended
+snapshot also reports the coherent order, row, tick, active flag, and monotonic
+completed-row count.
+
+These calls use the same single-producer/single-consumer command ring as the
+original transport API. Submit controls from one control thread, render from
+one audio thread, and never mutate a `chipseq_song` while either side may still
+reference it.
+
 An SFX is not a separate type: it *is* a `chipseq_song` of one or two channels,
 played on an SFX slot. A jingle and a laser share the entire pipeline.
 

@@ -93,7 +93,8 @@ static const uint8_t k_noise_note[16] = {
 /* Command op-codes (private). */
 enum {
     OP_MUSIC_PLAY = 1, OP_MUSIC_STOP, OP_MUSIC_VOL, OP_MUSIC_PAUSE,
-    OP_SFX_PLAY, OP_SFX_SET, OP_SFX_STOP, OP_SFX_STOP_ALL
+    OP_SFX_PLAY, OP_SFX_SET, OP_SFX_STOP, OP_SFX_STOP_ALL,
+    OP_MUSIC_REPLACE, OP_MUSIC_CHANNEL_MIX, OP_MUSIC_SWING
 };
 
 /* SFX claim-word states (2 bits). */
@@ -529,7 +530,17 @@ bool chipseq_song_validate(const chipseq_song *song, char *err, size_t err_len) 
 /* pure transport (position + timing); shared by renderer and song_frames    */
 /* ======================================================================== */
 
-static void apply_speed_tempo(const chipseq_song *song, chipseq_track *t, uint32_t rate) {
+static uint64_t apply_swing(uint64_t base, uint8_t percent,
+                            uint64_t rows_elapsed) {
+    if (percent <= 50u) return base;
+    uint64_t pair = base * 2u;
+    uint64_t longer = (pair * percent) / 100u;
+    uint64_t selected = (rows_elapsed & 1u) == 0u ? longer : pair - longer;
+    return selected == 0u ? 1u : selected;
+}
+
+static void apply_speed_tempo(const chipseq_song *song, chipseq_track *t,
+                              uint32_t rate, uint8_t swing_percent) {
     const chipseq_pattern *pat = &song->patterns[song->order[t->order_pos]];
     for (uint8_t c = 0; c < t->channels; c++) {
         const chipseq_cell *cell = &pat->cells[(size_t)t->row * t->channels + c];
@@ -541,16 +552,20 @@ static void apply_speed_tempo(const chipseq_song *song, chipseq_track *t, uint32
             t->bpm_q8 = b;
         }
     }
-    t->samples_per_tick = calc_spt(rate, t->bpm_q8, song->rows_per_beat, t->ticks_per_row);
+    uint64_t base = calc_spt(rate, t->bpm_q8, song->rows_per_beat,
+                             t->ticks_per_row);
+    t->samples_per_tick = apply_swing(base, swing_percent, t->rows_elapsed);
 }
 
 /* Advance one tick. Returns false when a non-looping song has ended. */
-static bool transport_step_tick(const chipseq_song *song, chipseq_track *t, uint32_t rate) {
+static bool transport_step_tick(const chipseq_song *song, chipseq_track *t,
+                                uint32_t rate, uint8_t swing_percent) {
     if ((uint16_t)(t->tick + 1) < t->ticks_per_row) {
         t->tick = (uint8_t)(t->tick + 1);
         return true;
     }
     t->tick = 0;
+    t->rows_elapsed++;
 
     const chipseq_pattern *pat = &song->patterns[song->order[t->order_pos]];
     int32_t jump_order = -1, break_row = 0;
@@ -584,7 +599,7 @@ static bool transport_step_tick(const chipseq_song *song, chipseq_track *t, uint
     const chipseq_pattern *np = &song->patterns[song->order[t->order_pos]];
     if (t->row >= np->rows) t->row = 0;
 
-    apply_speed_tempo(song, t, rate);
+    apply_speed_tempo(song, t, rate, swing_percent);
     return true;
 }
 
@@ -606,7 +621,7 @@ uint64_t chipseq_song_frames(const chipseq_song *song, uint32_t sr) {
     t.bpm_q8 = song->bpm_q8;
     t.channels = song->channels;
     t.active = 1; t.looping = 0;
-    apply_speed_tempo(song, &t, sr);
+    apply_speed_tempo(song, &t, sr, 50u);
 
     /* Floyd cycle detection covers effect-driven loops (for example an
      * FX_ORDER_JUMP back to the same row) even when loop_order says NO_LOOP. */
@@ -630,17 +645,19 @@ uint64_t chipseq_song_frames(const chipseq_song *song, uint32_t sr) {
         whole_frames += add_whole + carry;
         frac_frames = (uint32_t)frac_sum;
 
-        if (!transport_step_tick(song, &t, sr)) break;
+        if (!transport_step_tick(song, &t, sr, 50u)) break;
 
-        if (slow_live) slow_live = transport_step_tick(song, &slow, sr);
+        if (slow_live) slow_live = transport_step_tick(song, &slow, sr, 50u);
         if (fast_live) {
-            fast_live = transport_step_tick(song, &fast, sr);
-            if (fast_live) fast_live = transport_step_tick(song, &fast, sr);
+            fast_live = transport_step_tick(song, &fast, sr, 50u);
+            if (fast_live)
+                fast_live = transport_step_tick(song, &fast, sr, 50u);
         }
         if (slow_live && fast_live &&
             slow.order_pos == fast.order_pos && slow.row == fast.row &&
             slow.tick == fast.tick && slow.ticks_per_row == fast.ticks_per_row &&
             slow.bpm_q8 == fast.bpm_q8 &&
+            (slow.rows_elapsed & 1u) == (fast.rows_elapsed & 1u) &&
             slow.samples_per_tick == fast.samples_per_tick)
             return UINT64_MAX;
     }
@@ -726,6 +743,20 @@ static void refresh_voice(chipseq *seq, chipseq_track *t, uint8_t ch, int32_t *v
     }
     vol = clampi(vol, 0, 64);
     uint32_t tg = track_gain_q8(seq, t);
+    if (track_is_music(seq, t)) {
+        if ((seq->music_channel_mute_mask & (uint8_t)(1u << ch)) != 0u)
+            tg = 0u;
+        else
+            tg = (tg * seq->music_channel_gain_q8[ch]) >> 8;
+        /* Treat the channel control as a trim around centre so a default
+         * batch preserves per-row PAN effects while callers can still shift
+         * the whole channel left or right. */
+        seq->voice_effective_pan[vi] = (uint8_t)clampi(
+            (int32_t)v->pan + (int32_t)seq->music_channel_pan[ch] - 128,
+            0, 255);
+    } else {
+        seq->voice_effective_pan[vi] = v->pan;
+    }
     vgain[vi] = (int32_t)((uint32_t)vol * tg);   /* 0..64*256 */
 
     /* --- effective pitch (1/16-semitone) --- */
@@ -904,9 +935,45 @@ static void render_process_tick(chipseq *seq, chipseq_track *t, int32_t *vgain) 
     refresh_track(seq, t, vgain);
 }
 
+static void replace_music_now(chipseq *seq, const chipseq_song *song,
+                              bool loop, chipseq_replace_mode mode,
+                              uint32_t generation, int32_t *vgain);
+
+static bool apply_music_boundary_controls(chipseq *seq, int32_t *vgain) {
+    chipseq_track *music = &seq->music;
+    if (seq->pending_swing) {
+        seq->music_swing_percent = seq->pending_swing_percent;
+        seq->pending_swing = false;
+        apply_speed_tempo(music->song, music, seq->out_rate,
+                          seq->music_swing_percent);
+    }
+    if (!seq->pending_music) return false;
+    bool due = seq->pending_music_boundary == CHIPSEQ_REPLACE_NEXT_ROW;
+    if (!due && music->song->rows_per_beat != 0u)
+        due = music->rows_elapsed % music->song->rows_per_beat == 0u;
+    if (!due) return false;
+    replace_music_now(seq, seq->pending_music_song,
+                      seq->pending_music_loop != 0u,
+                      (chipseq_replace_mode)seq->pending_music_mode,
+                      seq->pending_music_generation, vgain);
+    return true;
+}
+
 static void advance_to_next_tick(chipseq *seq, chipseq_track *t, unsigned slot,
                                  int32_t *vgain) {
-    if (!transport_step_tick(t->song, t, seq->out_rate)) {
+    uint8_t swing = track_is_music(seq, t) ? seq->music_swing_percent : 50u;
+    if (!transport_step_tick(t->song, t, seq->out_rate, swing)) {
+        if (track_is_music(seq, t) && seq->pending_music) {
+            if (seq->pending_swing) {
+                seq->music_swing_percent = seq->pending_swing_percent;
+                seq->pending_swing = false;
+            }
+            replace_music_now(seq, seq->pending_music_song,
+                              seq->pending_music_loop != 0u,
+                              (chipseq_replace_mode)seq->pending_music_mode,
+                              seq->pending_music_generation, vgain);
+            return;
+        }
         t->active = 0;
         silence_track_voices(seq, t, vgain);
         if (!track_is_music(seq, t)) {
@@ -917,6 +984,9 @@ static void advance_to_next_tick(chipseq *seq, chipseq_track *t, unsigned slot,
         }
         return;
     }
+    if (track_is_music(seq, t) && t->tick == 0u &&
+        apply_music_boundary_controls(seq, vgain))
+        return;
     render_process_tick(seq, t, vgain);
 }
 
@@ -1065,7 +1135,7 @@ static void mix_oversample(chipseq *seq, const int32_t *vgain,
             int32_t left = vl;
             int32_t right = vl;
             if (stereo) {
-                int32_t pan = v->pan;
+                int32_t pan = seq->voice_effective_pan[vi];
                 left = (vl * (255 - pan) + 127) / 255;
                 right = (vl * pan + 127) / 255;
             }
@@ -1096,7 +1166,7 @@ static void mix_oversample(chipseq *seq, const int32_t *vgain,
         }
         int64_t c = floor_shift_i64((int64_t)w * g, 8);
         if (stereo) {
-            int32_t pan = v->pan;
+            int32_t pan = seq->voice_effective_pan[vi];
             linL += floor_shift_i64(c * (255 - pan), 8);
             linR += floor_shift_i64(c * pan, 8);
         } else {
@@ -1181,6 +1251,7 @@ static void reset_track_voices(chipseq *seq, uint8_t first, uint8_t channels) {
         memset(v, 0, sizeof *v);
         v->vol = 64;
         v->pan = 128;
+        seq->voice_effective_pan[(unsigned)first + c] = 128u;
         v->duty = CHIPSEQ_DUTY_50;
         v->lfsr = K_LFSR_SEED;
     }
@@ -1198,14 +1269,72 @@ static void start_track(chipseq *seq, chipseq_track *t, const chipseq_song *song
     t->paused = 0;
     t->active = 1;
     t->tick_accum = 0;
+    t->rows_elapsed = 0;
     reset_track_voices(seq, first_voice, song->channels);
-    apply_speed_tempo(song, t, seq->out_rate);
+    apply_speed_tempo(song, t, seq->out_rate,
+                      track_is_music(seq, t) ? seq->music_swing_percent : 50u);
+}
+
+static uint64_t song_total_rows(const chipseq_song *song) {
+    uint64_t total = 0u;
+    for (uint16_t order = 0u; order < song->order_length; ++order)
+        total += song->patterns[song->order[order]].rows;
+    return total;
+}
+
+static void locate_linear_row(const chipseq_song *song, uint64_t linear,
+                              uint16_t *order_pos, uint16_t *row) {
+    uint64_t total = song_total_rows(song);
+    if (total == 0u) {
+        *order_pos = 0u;
+        *row = 0u;
+        return;
+    }
+    linear %= total;
+    for (uint16_t order = 0u; order < song->order_length; ++order) {
+        uint16_t rows = song->patterns[song->order[order]].rows;
+        if (linear < rows) {
+            *order_pos = order;
+            *row = (uint16_t)linear;
+            return;
+        }
+        linear -= rows;
+    }
+    *order_pos = 0u;
+    *row = 0u;
+}
+
+static void replace_music_now(chipseq *seq, const chipseq_song *song,
+                              bool loop, chipseq_replace_mode mode,
+                              uint32_t generation, int32_t *vgain) {
+    uint64_t rows_elapsed = seq->music.rows_elapsed;
+    uint64_t tick_accum = seq->music.tick_accum;
+    silence_track_voices(seq, &seq->music, vgain);
+    seq->music.fade_ticks = 0u;
+    seq->music.fade_left = 0u;
+    start_track(seq, &seq->music, song, 0u, loop);
+    if (mode == CHIPSEQ_REPLACE_PRESERVE_POSITION) {
+        seq->music.rows_elapsed = rows_elapsed;
+        locate_linear_row(song, rows_elapsed, &seq->music.order_pos,
+                          &seq->music.row);
+        apply_speed_tempo(song, &seq->music, seq->out_rate,
+                          seq->music_swing_percent);
+        seq->music.tick_accum = tick_accum < seq->music.samples_per_tick
+                                  ? tick_accum : 0u;
+    }
+    render_process_tick(seq, &seq->music, vgain);
+    seq->music_applied_generation = generation;
+    seq->pending_music = false;
+    seq->pending_music_song = NULL;
 }
 
 static void apply_cmd(chipseq *seq, const chipseq_cmd *cmd, int32_t *vgain) {
     switch (cmd->op) {
     case OP_MUSIC_PLAY: {
         chipseq_track *t = &seq->music;
+        seq->pending_music = false;
+        seq->pending_music_song = NULL;
+        seq->music_applied_generation = 0u;
         silence_track_voices(seq, t, vgain);
         t->fade_ticks = 0; t->fade_left = 0;
         t->generation = 256;   /* music volume, 1/256 */
@@ -1214,6 +1343,8 @@ static void apply_cmd(chipseq *seq, const chipseq_cmd *cmd, int32_t *vgain) {
         break;
     }
     case OP_MUSIC_STOP:
+        seq->pending_music = false;
+        seq->pending_music_song = NULL;
         if (cmd->ia <= 0) {
             seq->music.active = 0;
             silence_track_voices(seq, &seq->music, vgain);
@@ -1227,6 +1358,36 @@ static void apply_cmd(chipseq *seq, const chipseq_cmd *cmd, int32_t *vgain) {
         break;
     case OP_MUSIC_PAUSE:
         seq->music.paused = cmd->loop ? 1u : 0u;
+        break;
+    case OP_MUSIC_REPLACE:
+        if (!seq->music.active) {
+            replace_music_now(seq, cmd->song, cmd->loop != 0u,
+                              (chipseq_replace_mode)cmd->ib,
+                              cmd->generation, vgain);
+        } else {
+            seq->pending_music_song = cmd->song;
+            seq->pending_music_generation = cmd->generation;
+            seq->pending_music_boundary = cmd->slot;
+            seq->pending_music_mode = (uint8_t)cmd->ib;
+            seq->pending_music_loop = cmd->loop;
+            seq->pending_music = true;
+        }
+        break;
+    case OP_MUSIC_CHANNEL_MIX:
+        memcpy(seq->music_channel_gain_q8, cmd->channel_gain_q8,
+               sizeof seq->music_channel_gain_q8);
+        memcpy(seq->music_channel_pan, cmd->channel_pan,
+               sizeof seq->music_channel_pan);
+        seq->music_channel_mute_mask = cmd->channel_mute_mask;
+        refresh_track(seq, &seq->music, vgain);
+        break;
+    case OP_MUSIC_SWING:
+        if (seq->music.active) {
+            seq->pending_swing_percent = (uint8_t)cmd->ia;
+            seq->pending_swing = true;
+        } else {
+            seq->music_swing_percent = (uint8_t)cmd->ia;
+        }
         break;
     case OP_SFX_PLAY: {
         unsigned slot = cmd->slot;
@@ -1288,7 +1449,8 @@ static bool queue_drain(chipseq *seq, int32_t *vgain) {
     bool playhead_changed = false;
     while (tail != head) {
         const chipseq_cmd *cmd = &seq->queue[tail % CHIPSEQ_CMD_QUEUE];
-        if (cmd->op == OP_MUSIC_PLAY || cmd->op == OP_MUSIC_STOP)
+        if (cmd->op == OP_MUSIC_PLAY || cmd->op == OP_MUSIC_STOP ||
+            cmd->op == OP_MUSIC_REPLACE)
             playhead_changed = true;
         apply_cmd(seq, cmd, vgain);
         tail++;
@@ -1312,6 +1474,15 @@ static void write_snapshot(chipseq *seq) {
     (void)atomic_fetch_add_explicit(&seq->snap_seq, 1u, memory_order_seq_cst);
     atomic_store_explicit(&seq->snap_position, position, memory_order_seq_cst);
     atomic_store_explicit(&seq->snap_state, state, memory_order_seq_cst);
+    atomic_store_explicit(&seq->snap_generation,
+                          seq->music_applied_generation,
+                          memory_order_seq_cst);
+    atomic_store_explicit(&seq->snap_rows_low,
+                          (uint32_t)seq->music.rows_elapsed,
+                          memory_order_seq_cst);
+    atomic_store_explicit(&seq->snap_rows_high,
+                          (uint32_t)(seq->music.rows_elapsed >> 32),
+                          memory_order_seq_cst);
     (void)atomic_fetch_add_explicit(&seq->snap_seq, 1u, memory_order_seq_cst);
 }
 
@@ -1509,6 +1680,9 @@ bool chipseq_init(chipseq *seq, const chipseq_options *options) {
     atomic_init(&seq->snap_seq, 0u);
     atomic_init(&seq->snap_position, 0u);
     atomic_init(&seq->snap_state, 0u);
+    atomic_init(&seq->snap_generation, 0u);
+    atomic_init(&seq->snap_rows_low, 0u);
+    atomic_init(&seq->snap_rows_high, 0u);
     atomic_init(&seq->enabled, 0u);
 
     if (!options_are_valid(&selected)) return false;
@@ -1521,6 +1695,12 @@ bool chipseq_init(chipseq *seq, const chipseq_options *options) {
     seq->volume_q8 = float_to_q8(selected.volume);
     seq->duck_q8 = float_to_q8(selected.sfx_duck);
     seq->lowpass = selected.lowpass;
+    seq->music_swing_percent = 50u;
+    seq->music.generation = 256u;
+    for (uint8_t channel = 0u; channel < CHIPSEQ_CHANNELS_MAX; ++channel) {
+        seq->music_channel_gain_q8[channel] = 256u;
+        seq->music_channel_pan[channel] = 128u;
+    }
 
     for (int n = 0; n < 128; n++) {
         int d = n - 69;
@@ -1545,6 +1725,10 @@ void chipseq_shutdown(chipseq *seq) {
     if (!seq) return;
     seq->music.active = 0;
     seq->music.paused = 0;
+    seq->pending_music = false;
+    seq->pending_music_song = NULL;
+    seq->pending_swing = false;
+    seq->music_applied_generation = 0u;
     for (unsigned i = 0; i < CHIPSEQ_SFX_SLOTS; i++) {
         seq->sfx[i].active = 0;
         atomic_store_explicit(&seq->sfx_claim[i], claim_pack(ST_FREE, 0),
@@ -1554,6 +1738,9 @@ void chipseq_shutdown(chipseq *seq) {
     atomic_store_explicit(&seq->queue_tail, 0u, memory_order_relaxed);
     atomic_store_explicit(&seq->snap_position, 0u, memory_order_relaxed);
     atomic_store_explicit(&seq->snap_state, 0u, memory_order_relaxed);
+    atomic_store_explicit(&seq->snap_generation, 0u, memory_order_relaxed);
+    atomic_store_explicit(&seq->snap_rows_low, 0u, memory_order_relaxed);
+    atomic_store_explicit(&seq->snap_rows_high, 0u, memory_order_relaxed);
     atomic_store_explicit(&seq->snap_seq, 0u, memory_order_release);
     atomic_store_explicit(&seq->enabled, 0u, memory_order_relaxed);
     seq->initialized = false;
@@ -1589,6 +1776,7 @@ bool chipseq_music_play(chipseq *seq, const chipseq_song *song, bool loop,
         set_err(err, err_len, "command queue full");
         return false;
     }
+    seq->music_queued_generation = 0u;
     return true;
 }
 
@@ -1620,25 +1808,121 @@ bool chipseq_music_set_paused(chipseq *seq, bool paused) {
     return queue_push(seq, &c);
 }
 
-bool chipseq_music_position(const chipseq *seq, uint16_t *order_pos,
-                            uint16_t *row, uint8_t *tick) {
-    if (!seq || !seq->initialized) return false;
-    unsigned position, state;
-    for (unsigned attempt = 0; attempt < 64u; attempt++) {
-        unsigned before, after;
-        before = atomic_load_explicit(&seq->snap_seq, memory_order_seq_cst);
+void chipseq_channel_mix_init(chipseq_channel_mix *mix) {
+    if (!mix) return;
+    memset(mix, 0, sizeof *mix);
+    for (uint8_t channel = 0u; channel < CHIPSEQ_CHANNELS_MAX; ++channel) {
+        mix->gain[channel] = 1.0f;
+        mix->pan[channel] = 128u;
+    }
+}
+
+bool chipseq_music_set_channel_mix(chipseq *seq,
+                                   const chipseq_channel_mix *mix) {
+    if (!seq || !seq->initialized || !mix) return false;
+    chipseq_cmd c;
+    memset(&c, 0, sizeof c);
+    c.op = OP_MUSIC_CHANNEL_MIX;
+    c.channel_mute_mask = mix->mute_mask;
+    for (uint8_t channel = 0u; channel < CHIPSEQ_CHANNELS_MAX; ++channel) {
+        if (!gain_is_valid(mix->gain[channel])) return false;
+        c.channel_gain_q8[channel] = (uint16_t)float_to_q8(
+            mix->gain[channel]);
+        c.channel_pan[channel] = mix->pan[channel];
+    }
+    return queue_push(seq, &c);
+}
+
+bool chipseq_music_set_swing(chipseq *seq, uint8_t percent) {
+    if (!seq || !seq->initialized || percent < 50u || percent > 75u)
+        return false;
+    chipseq_cmd c;
+    memset(&c, 0, sizeof c);
+    c.op = OP_MUSIC_SWING;
+    c.ia = percent;
+    return queue_push(seq, &c);
+}
+
+bool chipseq_music_replace(chipseq *seq, const chipseq_song *song, bool loop,
+                           chipseq_replace_boundary boundary,
+                           chipseq_replace_mode mode, uint32_t generation,
+                           char *err, size_t err_len) {
+    if (!seq || !seq->initialized) {
+        set_err(err, err_len, "engine not initialized");
+        return false;
+    }
+    if ((boundary != CHIPSEQ_REPLACE_NEXT_ROW &&
+         boundary != CHIPSEQ_REPLACE_NEXT_BEAT) ||
+        (mode != CHIPSEQ_REPLACE_PRESERVE_POSITION &&
+         mode != CHIPSEQ_REPLACE_RESTART) || generation == 0u) {
+        set_err(err, err_len, "invalid replacement options");
+        return false;
+    }
+    if (generation <= seq->music_queued_generation) {
+        set_err(err, err_len, "replacement generation is not monotonic");
+        return false;
+    }
+    if (!chipseq_song_validate(song, err, err_len)) return false;
+    if (!atomic_load_explicit(&seq->enabled, memory_order_acquire)) {
+        set_err(err, err_len, "engine disabled");
+        return false;
+    }
+    chipseq_cmd c;
+    memset(&c, 0, sizeof c);
+    c.op = OP_MUSIC_REPLACE;
+    c.slot = (uint8_t)boundary;
+    c.ib = (int32_t)mode;
+    c.generation = generation;
+    c.song = song;
+    c.loop = loop ? 1u : 0u;
+    if (!queue_push(seq, &c)) {
+        set_err(err, err_len, "command queue full");
+        return false;
+    }
+    seq->music_queued_generation = generation;
+    return true;
+}
+
+bool chipseq_music_snapshot(const chipseq *seq, chipseq_playhead *out) {
+    if (!seq || !seq->initialized || !out) return false;
+    memset(out, 0, sizeof *out);
+    for (unsigned attempt = 0u; attempt < 64u; ++attempt) {
+        unsigned before = atomic_load_explicit(&seq->snap_seq,
+                                               memory_order_seq_cst);
         if ((before & 1u) != 0u) continue;
-        position = atomic_load_explicit(&seq->snap_position, memory_order_seq_cst);
-        state = atomic_load_explicit(&seq->snap_state, memory_order_seq_cst);
-        after = atomic_load_explicit(&seq->snap_seq, memory_order_seq_cst);
+        unsigned position = atomic_load_explicit(&seq->snap_position,
+                                                 memory_order_seq_cst);
+        unsigned state = atomic_load_explicit(&seq->snap_state,
+                                              memory_order_seq_cst);
+        unsigned generation = atomic_load_explicit(&seq->snap_generation,
+                                                   memory_order_seq_cst);
+        unsigned rows_low = atomic_load_explicit(&seq->snap_rows_low,
+                                                 memory_order_seq_cst);
+        unsigned rows_high = atomic_load_explicit(&seq->snap_rows_high,
+                                                  memory_order_seq_cst);
+        unsigned after = atomic_load_explicit(&seq->snap_seq,
+                                              memory_order_seq_cst);
         if (before != after || (after & 1u) != 0u) continue;
-        if (((state >> 8) & 1u) == 0u) return false;
-        if (order_pos) *order_pos = (uint16_t)(position & 0xFFFFu);
-        if (row) *row = (uint16_t)((position >> 16) & 0xFFFFu);
-        if (tick) *tick = (uint8_t)(state & 0xFFu);
+        out->order_pos = (uint16_t)(position & 0xFFFFu);
+        out->row = (uint16_t)((position >> 16) & 0xFFFFu);
+        out->tick = (uint8_t)(state & 0xFFu);
+        out->active = ((state >> 8) & 1u) != 0u;
+        out->applied_generation = generation;
+        out->rows_elapsed = ((uint64_t)rows_high << 32) | rows_low;
         return true;
     }
     return false;
+}
+
+bool chipseq_music_position(const chipseq *seq, uint16_t *order_pos,
+                            uint16_t *row, uint8_t *tick) {
+    chipseq_playhead snapshot;
+    if (!chipseq_music_snapshot(seq, &snapshot) || !snapshot.active)
+        return false;
+    if (order_pos) *order_pos = snapshot.order_pos;
+    if (row) *row = snapshot.row;
+    if (tick) *tick = snapshot.tick;
+    return true;
 }
 
 /* ======================================================================== */

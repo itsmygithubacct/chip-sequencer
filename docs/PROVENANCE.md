@@ -55,6 +55,12 @@ and never calls back into the API. The library owns no thread, no device, and no
 pipe; the scope boundary against a transport mixer is described in full in
 [../README.md](../README.md).
 
+Live replacement uses the same caller-owned-data rule as initial playback. The
+render thread only swaps validated immutable song pointers at a musical
+boundary, then publishes a monotonically increasing generation in the coherent
+playhead snapshot. That acknowledgement is the ownership fence that lets a
+caller retire older compiled arrangements without a lock in the audio path.
+
 ## Verification
 
 - `make test` — the headless unit suite plus the golden-hash determinism gate:
@@ -66,6 +72,6 @@ pipe; the scope boundary against a transport mixer is described in full in
 - `make sanitize` — the same suite under AddressSanitizer and
   UndefinedBehaviorSanitizer.
 - `make tsanitize` — concurrent render/playhead publication under
-  ThreadSanitizer.
+  ThreadSanitizer, including live replacement, swing, and channel-mix control.
 
 No audio hardware is touched by any test.

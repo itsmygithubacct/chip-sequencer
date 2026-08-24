@@ -3,6 +3,22 @@
 All notable user-visible changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/) while its public API remains pre-1.0.
 
+## 0.4.0 - 2026-08-24
+
+### Added
+
+- Atomic music-channel gain, pan, and mute batches for live mixer controls.
+- Straight-to-75-percent swing with row-pair duration preservation.
+- Row- and beat-quantized immutable song replacement with restart or
+  monotonic-position mapping.
+- A coherent extended playhead snapshot with completed rows and replacement
+  generation acknowledgement.
+
+### Changed
+
+- ThreadSanitizer coverage now exercises live mix, swing, replacement, and
+  extended snapshot handoffs in addition to the original transport controls.
+
 ## 0.3.0 - 2026-08-08
 
 ### Added

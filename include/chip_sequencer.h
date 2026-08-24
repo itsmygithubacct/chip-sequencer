@@ -52,7 +52,7 @@
 #endif
 
 #define CHIPSEQ_VERSION_MAJOR 0
-#define CHIPSEQ_VERSION_MINOR 3
+#define CHIPSEQ_VERSION_MINOR 4
 #define CHIPSEQ_VERSION_PATCH 0
 
 /* --- hard capacity limits baked into the object (nothing allocates) ------ */
@@ -147,6 +147,31 @@ typedef enum chipseq_mix_mode {
     CHIPSEQ_MIX_LINEAR = 0,   /* per-channel linear sum (default, game-friendly) */
     CHIPSEQ_MIX_NES           /* nonlinear pulse+TND lookup tables (console color) */
 } chipseq_mix_mode;
+
+typedef enum chipseq_replace_boundary {
+    CHIPSEQ_REPLACE_NEXT_ROW = 0,
+    CHIPSEQ_REPLACE_NEXT_BEAT = 1
+} chipseq_replace_boundary;
+
+typedef enum chipseq_replace_mode {
+    CHIPSEQ_REPLACE_PRESERVE_POSITION = 0,
+    CHIPSEQ_REPLACE_RESTART = 1
+} chipseq_replace_mode;
+
+typedef struct chipseq_channel_mix {
+    float gain[CHIPSEQ_CHANNELS_MAX]; /* 0..1, quantized to 1/256 */
+    uint8_t pan[CHIPSEQ_CHANNELS_MAX]; /* 0 left, 128 center, 255 right */
+    uint8_t mute_mask;                 /* bit N silences music channel N */
+} chipseq_channel_mix;
+
+typedef struct chipseq_playhead {
+    uint64_t rows_elapsed;
+    uint32_t applied_generation;
+    uint16_t order_pos;
+    uint16_t row;
+    uint8_t tick;
+    bool active;
+} chipseq_playhead;
 
 /* ======================================================================== */
 /* song data model (all caller-owned; the engine never copies or frees it)  */
@@ -259,6 +284,7 @@ typedef struct chipseq_track {   /* private: one music/sfx playhead */
     const chipseq_song *song;
     uint64_t tick_accum;         /* remainder accumulator */
     uint64_t samples_per_tick;   /* Q32 */
+    uint64_t rows_elapsed;       /* monotonic completed-row count */
     uint16_t order_pos, row;
     uint8_t  tick, ticks_per_row;
     uint16_t bpm_q8;
@@ -277,6 +303,9 @@ typedef struct chipseq_cmd {     /* private: one queued control command */
     float    fa;
     const chipseq_song *song;
     uint8_t  loop, pad[3];
+    uint16_t channel_gain_q8[CHIPSEQ_CHANNELS_MAX];
+    uint8_t channel_pan[CHIPSEQ_CHANNELS_MAX];
+    uint8_t channel_mute_mask;
 } chipseq_cmd;
 
 /* NB: SFX liveness is not included in the playhead snapshot. It is carried by
@@ -295,6 +324,21 @@ typedef struct chipseq {
     chipseq_track music;
     chipseq_track sfx[CHIPSEQ_SFX_SLOTS]; /* render-thread-private working state */
     uint16_t voice_generation;
+    const chipseq_song *pending_music_song;
+    uint32_t pending_music_generation;
+    uint32_t music_applied_generation;
+    uint32_t music_queued_generation; /* control-thread-private */
+    uint16_t music_channel_gain_q8[CHIPSEQ_CHANNELS_MAX];
+    uint8_t music_channel_pan[CHIPSEQ_CHANNELS_MAX];
+    uint8_t voice_effective_pan[CHIPSEQ_VOICES_MAX];
+    uint8_t music_channel_mute_mask;
+    uint8_t music_swing_percent;
+    uint8_t pending_swing_percent;
+    uint8_t pending_music_boundary;
+    uint8_t pending_music_mode;
+    uint8_t pending_music_loop;
+    bool pending_music;
+    bool pending_swing;
     /* render-thread-private streaming filter state. These PERSIST across render
      * blocks so the halfband decimation FIR and the one-pole lowpass are true
      * streaming filters: the signed sample sequence for a
@@ -323,6 +367,9 @@ typedef struct chipseq {
     atomic_uint snap_seq;
     atomic_uint snap_position; /* high 16: row, low 16: order_pos */
     atomic_uint snap_state;    /* bit 8: music_active, low 8: tick */
+    atomic_uint snap_generation;
+    atomic_uint snap_rows_low;
+    atomic_uint snap_rows_high;
     /* Master mute: a runtime control, so an atomic flag written directly by the
      * game thread (NOT via the command queue) and loaded by both threads. */
     atomic_uint enabled;
@@ -394,6 +441,34 @@ bool chipseq_music_set_volume(chipseq *seq, float volume);
 
 /* Pause/resume music (voices hold; the playhead freezes). */
 bool chipseq_music_set_paused(chipseq *seq, bool paused);
+
+/* Initialize a centered, unity-gain, unmuted channel-mix batch. */
+void chipseq_channel_mix_init(chipseq_channel_mix *mix);
+
+/* Apply all music-channel gain/pan/mute values as one render command. */
+bool chipseq_music_set_channel_mix(chipseq *seq,
+                                   const chipseq_channel_mix *mix);
+
+/* Swing percentage: 50 is straight; 51..75 lengthens even monotonic rows and
+ * shortens odd rows while each pair retains its unswung total duration. The
+ * change is applied at the next row boundary. */
+bool chipseq_music_set_swing(chipseq *seq, uint8_t percent);
+
+/* Queue a validated immutable song for a musical boundary. generation must be
+ * nonzero and caller-monotonic. PRESERVE maps rows_elapsed into the new song;
+ * RESTART begins at row zero. The caller owns old and candidate song storage
+ * until chipseq_music_snapshot reports that generation or a later one applied.
+ * A subsequently published stop or play cancels pending replacements. */
+bool chipseq_music_replace(chipseq *seq, const chipseq_song *song, bool loop,
+                           chipseq_replace_boundary boundary,
+                           chipseq_replace_mode mode, uint32_t generation,
+                           char *err, size_t err_len);
+
+/* Coherent extended playhead including monotonic rows and the last applied
+ * replacement generation. Returns false only for invalid/uninitialized input
+ * or when a bounded read cannot beat a concurrent publication; inactive state
+ * is returned with active == false. */
+bool chipseq_music_snapshot(const chipseq *seq, chipseq_playhead *out);
 
 /* Read the last-published playhead position (may be one block stale, never
  * torn). Any out pointer may be NULL. Returns false when no music is playing
